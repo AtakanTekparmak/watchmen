@@ -1,0 +1,243 @@
+"""Skill-folder I/O helpers: load, clone, render, introspect.
+
+A "skill folder" is a directory of ``<skill_name>/SKILL.md`` subdirs. Each
+``SKILL.md`` starts with a YAML frontmatter block (``---`` fenced) followed
+by free-form markdown body.
+
+We keep representations dirt-simple:
+
+* :class:`SkillDoc` — a parsed (frontmatter, body) pair plus the folder name.
+* :class:`SkillFolder` — a list of SkillDoc + the filesystem path they came
+  from. ``SkillFolder.write(dest)`` materializes back to disk.
+
+The rest of the track_a package manipulates ``SkillFolder`` in-memory, then
+writes the winning candidate to ``pass_<N>/{A,B,AB}/`` on disk so the
+evaluator can chew on it.
+"""
+
+from __future__ import annotations
+
+import copy
+import dataclasses
+import io
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+
+
+FRONTMATTER_FENCE = "---"
+
+
+@dataclass
+class SkillDoc:
+    """A single SKILL.md file, parsed into frontmatter dict + body text.
+
+    ``folder_name`` is the directory that contains the SKILL.md — it must
+    equal ``frontmatter['name']`` for the folder to validate.
+    """
+
+    folder_name: str
+    frontmatter: Dict[str, Any]
+    body: str
+
+    @property
+    def name(self) -> str:
+        v = self.frontmatter.get("name", "")
+        return str(v) if v is not None else ""
+
+    @property
+    def description(self) -> str:
+        v = self.frontmatter.get("description", "")
+        return str(v) if v is not None else ""
+
+    def render(self) -> str:
+        """Render back to the on-disk SKILL.md format (YAML frontmatter + body)."""
+        buf = io.StringIO()
+        buf.write(FRONTMATTER_FENCE)
+        buf.write("\n")
+        # sort_keys=False keeps the human-authored ordering intact.
+        yaml.safe_dump(
+            self.frontmatter,
+            buf,
+            sort_keys=False,
+            allow_unicode=True,
+            default_flow_style=False,
+        )
+        buf.write(FRONTMATTER_FENCE)
+        buf.write("\n\n")
+        buf.write(self.body.rstrip())
+        buf.write("\n")
+        return buf.getvalue()
+
+    def clone(self) -> "SkillDoc":
+        return SkillDoc(
+            folder_name=self.folder_name,
+            frontmatter=copy.deepcopy(self.frontmatter),
+            body=self.body,
+        )
+
+
+@dataclass
+class SkillFolder:
+    """A collection of SkillDocs loaded from (or to be written to) a dir."""
+
+    skills: List[SkillDoc] = field(default_factory=list)
+    source_path: Optional[Path] = None
+
+    # ------------- loading ----------------------------------------------
+
+    @classmethod
+    def load(cls, path: Path) -> "SkillFolder":
+        path = Path(path).expanduser().resolve()
+        if not path.is_dir():
+            raise FileNotFoundError(path)
+        skills: List[SkillDoc] = []
+        for child in sorted(path.iterdir()):
+            if not child.is_dir():
+                continue
+            skill_md = child / "SKILL.md"
+            if not skill_md.exists():
+                continue
+            skills.append(_parse_skill_md(child.name, skill_md.read_text(encoding="utf-8")))
+        return cls(skills=skills, source_path=path)
+
+    # ------------- mutation ---------------------------------------------
+
+    def clone(self) -> "SkillFolder":
+        return SkillFolder(
+            skills=[s.clone() for s in self.skills],
+            source_path=self.source_path,
+        )
+
+    def by_name(self, name: str) -> Optional[SkillDoc]:
+        for s in self.skills:
+            if s.folder_name == name or s.name == name:
+                return s
+        return None
+
+    def names(self) -> List[str]:
+        return [s.folder_name for s in self.skills]
+
+    def remove(self, name: str) -> bool:
+        before = len(self.skills)
+        self.skills = [s for s in self.skills if s.folder_name != name]
+        return len(self.skills) < before
+
+    def add(self, doc: SkillDoc) -> None:
+        if self.by_name(doc.folder_name):
+            raise ValueError(f"skill '{doc.folder_name}' already exists")
+        self.skills.append(doc)
+
+    def rename(self, old: str, new: str) -> None:
+        doc = self.by_name(old)
+        if not doc:
+            raise KeyError(old)
+        if any(s.folder_name == new for s in self.skills if s is not doc):
+            raise ValueError(f"target name '{new}' already in use")
+        doc.folder_name = new
+        doc.frontmatter["name"] = new
+
+    # ------------- persistence ------------------------------------------
+
+    def write(self, dest: Path) -> Path:
+        dest = Path(dest).expanduser().resolve()
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+        for s in self.skills:
+            sdir = dest / s.folder_name
+            sdir.mkdir(parents=True)
+            (sdir / "SKILL.md").write_text(s.render(), encoding="utf-8")
+        return dest
+
+    # ------------- introspection ----------------------------------------
+
+    def total_bytes(self) -> int:
+        return sum(len(s.render().encode("utf-8")) for s in self.skills)
+
+    def render_summary(self, *, body_chars: int = 1200) -> str:
+        """Compact human/LLM-readable render of the whole folder.
+
+        Trims each skill body to ``body_chars`` chars so LLM context stays
+        bounded. Used in Critic / Synth prompts.
+        """
+        parts: List[str] = []
+        for s in self.skills:
+            body = s.body.strip()
+            if len(body) > body_chars:
+                body = body[:body_chars].rstrip() + "\n...[truncated]"
+            parts.append(
+                f"### skill: {s.folder_name}\n"
+                f"name: {s.name}\n"
+                f"description: {s.description}\n\n"
+                f"{body}\n"
+            )
+        if not parts:
+            return "(empty skill folder)"
+        return "\n---\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+def _parse_skill_md(folder_name: str, text: str) -> SkillDoc:
+    """Split a SKILL.md into frontmatter dict + body string.
+
+    Accepts standard ``---\\n<yaml>\\n---\\n<body>`` form. If no frontmatter
+    is present we return an empty frontmatter dict and the full text as body.
+    """
+    stripped = text.lstrip("\ufeff")  # drop BOM if any
+    if not stripped.startswith(FRONTMATTER_FENCE):
+        return SkillDoc(folder_name=folder_name, frontmatter={}, body=stripped)
+
+    # Find closing fence. We scan line-by-line so a literal "---" inside the
+    # YAML body can't confuse us (valid YAML frontmatter ends at a line that
+    # is *exactly* "---").
+    lines = stripped.splitlines()
+    if not lines or lines[0].strip() != FRONTMATTER_FENCE:
+        return SkillDoc(folder_name=folder_name, frontmatter={}, body=stripped)
+
+    close_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == FRONTMATTER_FENCE:
+            close_idx = i
+            break
+    if close_idx is None:
+        # Malformed: opening fence with no close. Treat whole file as body
+        # so validators flag it.
+        return SkillDoc(folder_name=folder_name, frontmatter={}, body=stripped)
+
+    fm_text = "\n".join(lines[1:close_idx])
+    body = "\n".join(lines[close_idx + 1:]).lstrip("\n")
+    try:
+        fm = yaml.safe_load(fm_text) or {}
+    except yaml.YAMLError:
+        fm = {}
+    if not isinstance(fm, dict):
+        fm = {}
+    return SkillDoc(folder_name=folder_name, frontmatter=fm, body=body)
+
+
+def make_skill_doc(
+    folder_name: str,
+    *,
+    name: Optional[str] = None,
+    description: str = "",
+    body: str = "",
+    extra_frontmatter: Optional[Dict[str, Any]] = None,
+) -> SkillDoc:
+    """Build a SkillDoc with valid frontmatter. ``name`` defaults to folder_name."""
+    fm: Dict[str, Any] = {
+        "name": name or folder_name,
+        "description": description,
+        "version": "0.1.0",
+        "author": "Hermes Agent (track_a)",
+        "license": "MIT",
+    }
+    if extra_frontmatter:
+        fm.update(extra_frontmatter)
+    return SkillDoc(folder_name=folder_name, frontmatter=fm, body=body)

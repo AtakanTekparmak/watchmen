@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "_comment": "Curated subset where domain-specific skills (debugging heuristics, shell-fu, refactoring discipline) are plausibly load-bearing. | 2026-04-13: dropped fix-js-network-controller and cpp-daemon-sighup-segfault — agent flailed full 30-turn budget on both, dominated wall time without commensurate signal. | 2026-04-14: dropped all SWE-bench Verified tasks - M2.7 + 20 max-turns scored 0/4 on them with real verifiers; no usable gradient. Keep tblite-only for the M2.7 budget=10 run. | 2026-04-13(2): added 6 tblite tasks (jsonl-aggregator, build-merkle-tree-cli-sha512, build-system-task-ordering, application-debug, scan-linux-persistence-artifacts, monorepo-changelog-cli). All resolve paths under /app, avoid image-layer mutation, avoid agent-maintained daemons. | 2026-04-14: dropped broken-python (architectural false-negative). | 2026-04-20: dropped jq-data-processing, jsonl-aggregator, log-summary — empty skill solves them 1.000, pure noise in signal. Added 5 harder tasks where empty skill scores 0.000-0.346 or times out: python-api-rate-limit, industrial-kiln-controller, raft-log-repair-concurrent-access, api-endpoint-permission-canonicalizer, schedule-vacation. Stage 1 now picks the 2 near-miss tasks (schedule-vacation, application-debug) as cheapest 'canary' signals rather than trivial-pass easies, so cascade short-circuits only on truly broken candidates. | 2026-04-20(v3-fix): moved all tasks to stage 1 — with the easy canary tasks dropped, the old 2-task stage-1 gate became 0/2 on near-miss tasks that score high continuous but fail binary, triggering cascade truncation and misleading evolution with a 2-task-only composite. All-stage-1 means cascade only short-circuits on genuinely dead candidates (0/10 binary).",
+  "tasks": [
+    {
+      "task_id": "tblite/schedule-vacation",
+      "source": "tblite",
+      "dataset_task_name": "schedule-vacation",
+      "category": "tool-use",
+      "difficulty": "easy",
+      "skill_relevance": "tool-use + exact JSON schema — invoke 4 per-friend scripts with different output formats, normalize to canonical schema, use overlap solver, preserve stdout byte-for-byte",
+      "success_check_kind": "tblite_test_sh",
+      "timeout_s": 900,
+      "stage": 1
+    },
+    {
+      "task_id": "tblite/application-debug",
+      "source": "tblite",
+      "dataset_task_name": "application-debug",
+      "category": "debugging",
+      "difficulty": "hard",
+      "skill_relevance": "text-format discipline — exact line-by-line report + parallel JSON schema, percentage precision, running a data-gen script first",
+      "success_check_kind": "tblite_test_sh",
+      "timeout_s": 600,
+      "stage": 1
+    },
+    {
+      "task_id": "tblite/build-merkle-tree-cli-sha512",
+      "source": "tblite",
+      "dataset_task_name": "build-merkle-tree-cli-sha512",
+      "category": "software-engineering",
+      "difficulty": "easy",
+      "skill_relevance": "CLI construction — subcommand dispatch, SHA-512 (128-char) hygiene, odd-node duplication, verify-round-trip discipline",
+      "success_check_kind": "tblite_test_sh",
+      "timeout_s": 900,
+      "stage": 1
+    },
+    {
+      "task_id": "tblite/build-system-task-ordering",
+      "source": "tblite",
+      "dataset_task_name": "build-system-task-ordering",
+      "category": "algorithms",
+      "difficulty": "medium",
+      "skill_relevance": "graph algorithms + strict-spec adherence — alias canonicalization, SCC cycle detection, deterministic topological tie-breaking, PARSE_ERROR fast-path",
+      "success_check_kind": "tblite_test_sh",
+      "timeout_s": 900,
+      "stage": 1
+    },
+    {
+      "task_id": "tblite/scan-linux-persistence-artifacts",
+      "source": "tblite",
+      "dataset_task_name": "scan-linux-persistence-artifacts",
+      "category": "security",
+      "difficulty": "medium",
+      "skill_relevance": "bash + JSON schema — heterogeneous artifact detection, SHA256 hygiene, idempotency, deterministic sort (type then path)",
+      "success_check_kind": "tblite_test_sh",
+      "timeout_s": 900,
+      "stage": 1
+    },
+    {
+      "task_id": "tblite/monorepo-changelog-cli",
+      "source": "tblite",
+      "dataset_task_name": "monorepo-changelog-cli",
+      "category": "software-engineering",
+      "difficulty": "medium",
+      "skill_relevance": "git + semver reasoning — parse conventional commits, transitive dependency bump propagation across packages, changelog authorship",
+      "success_check_kind": "tblite_test_sh",
+      "timeout_s": 600,
+      "stage": 1
+    },
+    {
+      "task_id": "tblite/api-endpoint-permission-canonicalizer",
+      "source": "tblite",
+      "dataset_task_name": "api-endpoint-permission-canonicalizer",
+      "category": "software-engineering",
+      "difficulty": "medium",
+      "skill_relevance": "spec discipline / parse + normalize + dedup — 27 assertion suite covering hard-cutoff malformed-line parsing, path-var canonicalization, first-seen dedup, strict sort",
+      "success_check_kind": "tblite_test_sh",
+      "timeout_s": 900,
+      "stage": 1
+    },
+    {
+      "task_id": "tblite/industrial-kiln-controller",
+      "source": "tblite",
+      "dataset_task_name": "industrial-kiln-controller",
+      "category": "control-theory",
+      "difficulty": "medium",
+      "skill_relevance": "control theory + quantitative constraints — thermal inertia physics model, bounded total_error / total_gas / max_drop, avoid naive bang-bang",
+      "success_check_kind": "tblite_test_sh",
+      "timeout_s": 600,
+      "stage": 1
+    },
+    {
+      "task_id": "tblite/python-api-rate-limit",
+      "source": "tblite",
+      "dataset_task_name": "python-api-rate-limit",
+      "category": "debugging",
+      "difficulty": "medium",
+      "skill_relevance": "bug-hunt on multi-module surface — fix sliding-window limiter in /app/src/limiter/, accept unsorted/malformed timestamps, count parse_errors, deterministic across runs",
+      "success_check_kind": "tblite_test_sh",
+      "timeout_s": 900,
+      "stage": 1
+    },
+    {
+      "task_id": "tblite/raft-log-repair-concurrent-access",
+      "source": "tblite",
+      "dataset_task_name": "raft-log-repair-concurrent-access",
+      "category": "algorithms",
+      "difficulty": "medium",
+      "skill_relevance": "canonical output discipline — WAL line classification (BAD/INS/OK), conflict resolution rules, sorted output, no-trailing-newline hygiene",
+      "success_check_kind": "tblite_test_sh",
+      "timeout_s": 900,
+      "stage": 1
+    }
+  ]
+}
