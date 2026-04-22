@@ -164,19 +164,45 @@ def run_sequential(
         a_max_passes, phase_a_seed, phase_a,
     )
     t1 = time.monotonic()
-    a_history = run_track_a(
-        seed=phase_a_seed,
-        out=phase_a,
-        max_passes=a_max_passes,
-        force_synthetic=force_synthetic,
-        verify=verify,
-        outer_model=outer_model,
-        inner_model=inner_model,
-        max_workers=max_workers,
-        repeats=repeats,
-        sources=sources,
-        rng_seed=rng_seed,
-    )
+    phase_a_crash: Optional[str] = None
+    try:
+        a_history = run_track_a(
+            seed=phase_a_seed,
+            out=phase_a,
+            max_passes=a_max_passes,
+            force_synthetic=force_synthetic,
+            verify=verify,
+            outer_model=outer_model,
+            inner_model=inner_model,
+            max_workers=max_workers,
+            repeats=repeats,
+            sources=sources,
+            rng_seed=rng_seed,
+        )
+    except Exception as exc:
+        # Phase A can fail mid-run on a late mutation that produces
+        # malformed YAML or fails validation (openevolve patch bugs,
+        # LLM output quirks). Persist what we have and keep the run
+        # a partial success rather than a full crash — the phase_b
+        # artifacts are still useful on their own.
+        logger.exception(
+            "Track D: phase_a crashed (%s). Persisting partial history.",
+            type(exc).__name__,
+        )
+        phase_a_crash = f"{type(exc).__name__}: {exc}"
+        a_history = {
+            "passes": [],
+            "converged": False,
+            "final_score": None,
+            "crashed": True,
+            "crash_detail": phase_a_crash,
+        }
+        # Write the crash detail so the operator doesn't have to dig
+        # through stderr to find it.
+        phase_a.mkdir(parents=True, exist_ok=True)
+        (phase_a / "crash.json").write_text(
+            json.dumps(a_history, indent=2, default=str)
+        )
     t_a = time.monotonic() - t1
 
     # --- pin final ---
@@ -221,6 +247,7 @@ def run_sequential(
         "repeats": repeats,
         "force_synthetic": force_synthetic,
         "verify": verify,
+        "phase_a_crashed": phase_a_crash,
     }
     (out / "run_meta.json").write_text(json.dumps(summary, indent=2, default=str))
     logger.info(

@@ -258,6 +258,36 @@ _PYTEST_SUMMARY_RE = re.compile(
 )
 
 
+# Stderr fingerprints that indicate the container lost DNS/network during
+# apt-get. These come from colima networking hiccups, NOT from the agent's
+# output being wrong, so we retry the test.sh invocation a few times
+# before scoring the task as a real fail.
+_NETWORK_ERROR_MARKERS = (
+    "Could not resolve",
+    "Temporary failure resolving",
+    "Temporary failure in name resolution",
+    "Network is unreachable",
+    "Connection timed out",
+    "No address associated with hostname",
+)
+
+
+def _looks_like_network_failure(stdout: str, stderr: str) -> bool:
+    """True iff the test.sh stdout+stderr contains a DNS/network marker.
+
+    We OR stdout and stderr because apt-get writes some errors to stdout
+    with ``2>&1`` redirection in test scripts.
+    """
+    blob = (stdout or "") + "\n" + (stderr or "")
+    return any(marker in blob for marker in _NETWORK_ERROR_MARKERS)
+
+
+# Default retry count for test.sh invocations that fail on network. Each
+# retry costs one `docker exec` + the full test.sh timeout so we keep it
+# small. Overridden by tests.
+_TEST_SH_NETWORK_RETRIES = 2
+
+
 def _parse_pytest_stdout(stdout: str) -> Optional[Tuple[int, int]]:
     """Extract (passed, total_meaningful) from a pytest ``-rA`` tail.
 
@@ -421,13 +451,36 @@ def verify_tblite(
                 detail=cp.stderr[-500:],
             )
 
-        # Execute test.sh
+        # Execute test.sh. Retry up to ``_TEST_SH_NETWORK_RETRIES`` times
+        # if the failure stderr fingerprints as a DNS/network error — those
+        # come from colima networking hiccups during apt-get, not from the
+        # agent's output being wrong, so we do NOT want to score them as
+        # real fails. Any non-network failure returns on the first attempt.
+        network_retry_count = 0
+        network_retry_details: List[str] = []
+        tproc: subprocess.CompletedProcess[str]
         try:
-            tproc = subprocess.run(
-                ["docker", "exec", cname, "bash", "/tests/test.sh"],
-                capture_output=True, text=True,
-                timeout=timeout,
-            )
+            for attempt in range(_TEST_SH_NETWORK_RETRIES + 1):
+                tproc = subprocess.run(
+                    ["docker", "exec", cname, "bash", "/tests/test.sh"],
+                    capture_output=True, text=True,
+                    timeout=timeout,
+                )
+                if tproc.returncode == 0:
+                    break
+                if not _looks_like_network_failure(tproc.stdout, tproc.stderr):
+                    break
+                network_retry_count += 1
+                network_retry_details.append(
+                    f"attempt {attempt + 1}: rc={tproc.returncode} "
+                    f"(network fingerprint matched)"
+                )
+                logger.warning(
+                    "verify_tblite(%s): test.sh attempt %d hit network "
+                    "error; retrying (%d/%d).",
+                    task.get("task_id"), attempt + 1,
+                    network_retry_count, _TEST_SH_NETWORK_RETRIES,
+                )
         except subprocess.TimeoutExpired:
             return VerifyResult(
                 passed=False, status="test_sh_timeout",
@@ -435,6 +488,27 @@ def verify_tblite(
             )
         exit_code = tproc.returncode
         out_tail = (tproc.stdout or "")[-400:] + (tproc.stderr or "")[-400:]
+
+        # If all retries exhausted AND the final attempt still fingerprints
+        # as network-layer failure, report it under a distinct status so
+        # callers can filter infrastructure noise from real task fails.
+        if (
+            exit_code != 0
+            and network_retry_count >= _TEST_SH_NETWORK_RETRIES
+            and _looks_like_network_failure(tproc.stdout, tproc.stderr)
+        ):
+            detail = (
+                f"network failure persisted across "
+                f"{network_retry_count + 1} attempts; " +
+                "; ".join(network_retry_details) +
+                f"\nlast stderr tail: {(tproc.stderr or '')[-300:]}"
+            )
+            return VerifyResult(
+                passed=False,
+                status="network_fail",
+                detail=detail,
+                score=None,
+            )
 
         # Continuous score: prefer pytest-json-ctrf (harder tasks opt into
         # this at --ctrf /logs/verifier/ctrf.json), else parse the pytest

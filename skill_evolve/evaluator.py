@@ -777,11 +777,18 @@ def evaluate(
     s1_outcomes = _run_batch(stage1)
     outcomes.extend(s1_outcomes)
 
-    # Cascade short-circuits when stage-1 is 0/N on the *primary* success
-    # signal (verifier pass if verified; trajectory-exists fallback
-    # otherwise). This stays cheap even with real Docker/SWE-bench
-    # verification in stage-2+.
-    if cascade and stage1 and all(not o.success for o in s1_outcomes):
+    # Cascade short-circuit. Uses continuous ``score`` when available
+    # (threshold 0.3 on per-task mean), binary ``success`` as fallback.
+    # Previous behavior (binary-only) was wrong under continuous scoring:
+    # a folder whose stage-1 tasks all hit 0.92 mean_score but fail the
+    # binary gate would still short-circuit, truncating the composite to
+    # a 2-task mean and producing inflated-looking scores.
+    def _effective_score(o: TaskOutcome) -> float:
+        if o.score is not None:
+            return float(o.score)
+        return 1.0 if o.success else 0.0
+
+    if cascade and stage1 and all(_effective_score(o) < 0.3 for o in s1_outcomes):
         cascade_truncated = True
     else:
         outcomes.extend(_run_batch(rest))
@@ -801,6 +808,12 @@ def evaluate(
     # for tasks that don't. This keeps the mean interpretable as
     # "assertion-level pass rate averaged across the benchmark" without
     # biasing toward whichever tasks happened to expose a breakdown.
+    #
+    # When cascade truncates, ``outcomes`` contains only stage-1 tasks,
+    # so a mean over it is not comparable to a full-benchmark mean. We
+    # return ``mean_score=None`` in that case so naive cross-run
+    # comparisons can't silently mix 2-task and 10-task means. Callers
+    # that want the truncated mean can compute it from ``per_task``.
     per_task_scores: List[float] = []
     for o in outcomes:
         if o.score is not None:
@@ -808,9 +821,12 @@ def evaluate(
         else:
             per_task_scores.append(1.0 if o.success else 0.0)
     scored_task_count = sum(1 for o in outcomes if o.score is not None)
-    mean_score = (
-        sum(per_task_scores) / n if (n and scored_task_count) else None
-    )
+    if cascade_truncated:
+        mean_score = None
+    else:
+        mean_score = (
+            sum(per_task_scores) / n if (n and scored_task_count) else None
+        )
 
     composite = compute_composite(
         success_rate, avg_tool_calls, mean_score=mean_score

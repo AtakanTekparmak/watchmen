@@ -284,6 +284,93 @@ def test_compute_composite_falls_back_to_success_rate():
     assert c == pytest.approx(0.75)
 
 
+def test_cascade_uses_continuous_score_threshold_not_binary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Cascade must NOT truncate when stage-1 tasks are binary-FAIL but
+    continuous-high. Regression test for the v3 launch bug where near-miss
+    stage-1 tasks (score 0.83-0.92, binary FAIL) short-circuited every
+    eval to a 2-task composite.
+    """
+    skills = tmp_path / "skills"
+    (skills / "demo").mkdir(parents=True)
+    (skills / "demo" / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: demo\n---\nbody\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        _ev, "load_subset",
+        lambda **kw: [
+            {"task_id": "s1_near_miss", "stage": 1, "prompt": "x",
+             "timeout_s": 10},
+            {"task_id": "s2_real", "stage": 2, "prompt": "y", "timeout_s": 10},
+        ],
+    )
+
+    def fake_run_one_task(task, skills_folder, **kwargs):
+        if task["task_id"] == "s1_near_miss":
+            return TaskOutcome(
+                task_id="s1_near_miss", success=False, tool_calls=0,
+                elapsed_s=0.0, verified=False, verifier_status="test_failed",
+                score=0.92,
+            )
+        return TaskOutcome(
+            task_id="s2_real", success=True, tool_calls=0, elapsed_s=0.0,
+            verified=True, verifier_status="ok", score=1.0,
+        )
+
+    monkeypatch.setattr(_ev, "_run_one_task", fake_run_one_task)
+    res = evaluate(skills, cascade=True, verify=False)
+
+    # Stage 1 task's continuous score is 0.92 >> 0.3 threshold, so cascade
+    # must NOT truncate. Stage 2 runs and outcomes contain both tasks.
+    assert res.n_tasks == 2
+    assert res.cascade_truncated is False
+    assert res.mean_score is not None
+    assert res.mean_score == pytest.approx((0.92 + 1.0) / 2)
+
+
+def test_cascade_truncates_when_stage1_scores_below_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Cascade should still fire when stage-1 tasks are genuinely dead
+    (continuous score < 0.3, binary FAIL). Also verifies mean_score is
+    suppressed to None when cascade truncates.
+    """
+    skills = tmp_path / "skills"
+    (skills / "demo").mkdir(parents=True)
+    (skills / "demo" / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: demo\n---\nbody\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        _ev, "load_subset",
+        lambda **kw: [
+            {"task_id": "s1_dead", "stage": 1, "prompt": "x", "timeout_s": 10},
+            {"task_id": "s2_never_runs", "stage": 2, "prompt": "y",
+             "timeout_s": 10},
+        ],
+    )
+
+    def fake_run_one_task(task, skills_folder, **kwargs):
+        return TaskOutcome(
+            task_id=task["task_id"], success=False, tool_calls=0,
+            elapsed_s=0.0, verified=False, verifier_status="test_failed",
+            score=0.1,
+        )
+
+    monkeypatch.setattr(_ev, "_run_one_task", fake_run_one_task)
+    res = evaluate(skills, cascade=True, verify=False)
+
+    assert res.cascade_truncated is True
+    # Stage 2 was skipped; outcomes has only s1_dead.
+    task_ids = [p["task_id"] for p in res.per_task]
+    assert task_ids == ["s1_dead"]
+    # mean_score must be suppressed to None when cascade truncates so
+    # callers can't silently compare truncated vs full means.
+    assert res.mean_score is None
+
+
 def test_evaluate_surfaces_mean_score_when_tasks_expose_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):

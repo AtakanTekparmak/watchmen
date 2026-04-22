@@ -25,6 +25,7 @@ import pytest
 
 from skill_evolve.verifiers import (
     VerifyResult,
+    _looks_like_network_failure,
     _parse_ctrf,
     _parse_pytest_stdout,
     docker_available,
@@ -34,6 +35,35 @@ from skill_evolve.verifiers import (
     verify_tblite,
     _reset_docker_cache,
 )
+
+
+# --- Network failure fingerprint (added 2026-04-22) ---
+
+def test_looks_like_network_failure_detects_dns():
+    stderr = (
+        "Err:3 http://deb.debian.org/debian bookworm InRelease\n"
+        "  Could not resolve 'deb.debian.org'\n"
+    )
+    assert _looks_like_network_failure("", stderr) is True
+
+
+def test_looks_like_network_failure_detects_temporary_resolution():
+    stderr = "Temporary failure in name resolution\n"
+    assert _looks_like_network_failure("", stderr) is True
+
+
+def test_looks_like_network_failure_rejects_plain_pytest_failure():
+    stdout = (
+        "FAILED test_outputs.py::test_foo - AssertionError: expected 5\n"
+        "===== 1 failed, 3 passed in 0.5s =====\n"
+    )
+    assert _looks_like_network_failure(stdout, "") is False
+
+
+def test_looks_like_network_failure_checks_stdout_when_stderr_empty():
+    # apt-get with `2>&1` redirection sometimes lands DNS errors on stdout.
+    stdout = "Could not resolve 'security.ubuntu.com'\n"
+    assert _looks_like_network_failure(stdout, "") is True
 
 
 # ---------------------------------------------------------------------------

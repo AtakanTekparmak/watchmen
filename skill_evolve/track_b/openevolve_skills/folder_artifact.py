@@ -31,9 +31,12 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, List
+
+import yaml
 
 
 # Hard limits — tuned for skill folders. Override only in tests.
@@ -46,6 +49,52 @@ _END_FENCE = "===== END FILE ====="
 
 class FolderArtifactError(ValueError):
     """Raised when a FolderArtifact violates size / path constraints."""
+
+
+_FRONTMATTER_FENCE = "---"
+
+
+def _is_skill_md(path: str) -> bool:
+    """True iff ``path`` refers to a SKILL.md at any folder depth."""
+    return path == "SKILL.md" or path.endswith("/SKILL.md")
+
+
+def _check_skill_md_frontmatter(path: str, content: str) -> None:
+    """Raise :class:`FolderArtifactError` if the SKILL.md frontmatter is
+    unparseable as YAML.
+
+    Mirrors the extraction rules in :func:`skill_evolve.track_a.folder._parse_skill_md`
+    so Track A's consumer and Track B's producer agree on what "valid" means.
+    Files without a leading ``---`` fence are allowed through (treated as a
+    body-only SKILL.md); only files that declare a frontmatter block but
+    produce a YAML error are rejected.
+    """
+    stripped = content.lstrip("\ufeff")
+    if not stripped.startswith(_FRONTMATTER_FENCE):
+        return  # No frontmatter block; downstream will handle defaults.
+    lines = stripped.splitlines()
+    if not lines or lines[0].strip() != _FRONTMATTER_FENCE:
+        return
+    close_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == _FRONTMATTER_FENCE:
+            close_idx = i
+            break
+    if close_idx is None:
+        raise FolderArtifactError(
+            f"{path}: opened '---' frontmatter fence without a closing '---'"
+        )
+    fm_text = "\n".join(lines[1:close_idx])
+    try:
+        loaded = yaml.safe_load(fm_text)
+    except yaml.YAMLError as exc:
+        raise FolderArtifactError(
+            f"{path}: YAML frontmatter unparseable: {exc}"
+        ) from exc
+    if loaded is not None and not isinstance(loaded, dict):
+        raise FolderArtifactError(
+            f"{path}: YAML frontmatter is {type(loaded).__name__}, expected dict"
+        )
 
 
 def _check_path(path: str) -> str:
@@ -109,6 +158,15 @@ class FolderArtifact:
         # Re-check each path (defense in depth).
         for p in self.files:
             _check_path(p)
+        # SKILL.md frontmatter must round-trip through yaml.safe_load. A
+        # patch mutation that produces an unquoted description containing a
+        # ":" passes every check above but breaks any downstream consumer
+        # that strictly parses the frontmatter (Track A, Track D handoff).
+        # We catch it at the artifact boundary so broken SKILL.md files
+        # cannot land in the MAP-Elites archive in the first place.
+        for p, content in self.files.items():
+            if _is_skill_md(p):
+                _check_skill_md_frontmatter(p, content)
 
     # -------------------- hashing / equality --------------------
 
