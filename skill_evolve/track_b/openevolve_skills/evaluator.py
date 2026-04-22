@@ -62,7 +62,7 @@ class SkillFolderEvaluator:
         cascade: bool = True,
         max_workers: int = 1,
         model: Optional[str] = None,
-        repeats: int = 1,
+        repeats: int = 3,
     ) -> None:
         self.force_synthetic = force_synthetic
         self.verify = verify

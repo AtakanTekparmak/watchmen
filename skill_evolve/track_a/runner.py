@@ -56,7 +56,7 @@ NEG_INF = -math.inf
 # Asymmetric model defaults: Sonnet 4.6 for the outer/meta LLM (critic /
 # op-planner / body-writer / synthesizer) and M2.7 for the inner Hermes
 # agent rollouts.  See V2_FIXES_PLAN.md (Fix 1).
-DEFAULT_OUTER_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_OUTER_MODEL = "moonshotai/kimi-k2.6"
 DEFAULT_INNER_MODEL = "minimax/minimax-m2.7"
 
 
@@ -254,7 +254,7 @@ def run_loop(
     outer_model: str = DEFAULT_OUTER_MODEL,
     inner_model: str = DEFAULT_INNER_MODEL,
     max_workers: int = 1,
-    repeats: int = 1,
+    repeats: int = 3,
     sources: Optional[List[str]] = None,
     rng_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -628,7 +628,7 @@ def _cli(argv: Optional[List[str]] = None) -> int:
     ap.add_argument(
         "--repeats",
         type=int,
-        default=1,
+        default=3,
         help="k repeat evaluations per candidate for "
         "majority-vote aggregation (default: 1 — no repeats)",
     )

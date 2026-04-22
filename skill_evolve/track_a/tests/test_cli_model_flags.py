@@ -99,10 +99,15 @@ def test_split_flags_sets_both() -> None:
 
 
 def test_split_flags_defaults() -> None:
-    """Defaults match the v2.1 asymmetric config (Sonnet 4.6 + M2.7)."""
+    """Defaults match the current asymmetric config (Kimi K2.6 + M2.7).
+
+    Changed 2026-04-22: outer model switched from Sonnet 4.6 to Kimi K2.6
+    after v3 showed Sonnet produced parse_errors on a material fraction
+    of patches and didn't beat the inner baseline enough to justify cost.
+    """
     ap = _build_parser_like_cli()
     args = ap.parse_args(["--seed", "x", "--out", "y"])
-    assert args.outer_model == "anthropic/claude-sonnet-4.6"
+    assert args.outer_model == "moonshotai/kimi-k2.6"
     assert args.inner_model == "minimax/minimax-m2.7"
     assert args.model is None
 

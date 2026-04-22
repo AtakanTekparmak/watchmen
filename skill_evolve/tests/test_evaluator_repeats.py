@@ -204,10 +204,15 @@ def test_evaluate_repeats_3_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert call_counter["tblite/other-task"] == 3
 
 
-def test_evaluate_default_repeats_1_is_backward_compat(
+def test_evaluate_default_repeats_3_aggregates(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    """Default ``repeats=1`` leaves ``repeats_detail`` empty (non-aggregated)."""
+    """Default ``repeats=3`` aggregates 3 calls per task.
+
+    Changed 2026-04-22 from ``repeats=1`` default: +/-0.2 single-eval
+    variance under continuous scoring made 1-rep composites unreliable.
+    New default is 3, so ``repeats_detail`` has 3 entries.
+    """
     skills = tmp_path / "skills"
     (skills / "demo").mkdir(parents=True)
     (skills / "demo" / "SKILL.md").write_text(
@@ -221,7 +226,10 @@ def test_evaluate_default_repeats_1_is_backward_compat(
                        "timeout_s": 10}],
     )
 
+    calls = {"n": 0}
+
     def fake_run_one_task(task, skills_folder, **kwargs):
+        calls["n"] += 1
         return TaskOutcome(
             task_id=task["task_id"],
             success=True,
@@ -233,8 +241,36 @@ def test_evaluate_default_repeats_1_is_backward_compat(
 
     monkeypatch.setattr(_ev, "_run_one_task", fake_run_one_task)
 
-    res = evaluate(skills, cascade=False, verify=False)  # repeats defaults to 1
+    res = evaluate(skills, cascade=False, verify=False)  # repeats defaults to 3
     assert res.n_tasks == 1
+    assert calls["n"] == 3
+    assert len(res.per_task[0]["repeats_detail"]) == 3
+
+
+def test_evaluate_repeats_1_leaves_detail_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Explicit ``repeats=1`` path still non-aggregated."""
+    skills = tmp_path / "skills"
+    (skills / "demo").mkdir(parents=True)
+    (skills / "demo" / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: demo\n---\nbody\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(
+        _ev, "load_subset",
+        lambda **kw: [{"task_id": "t1", "stage": 1, "prompt": "x",
+                       "timeout_s": 10}],
+    )
+
+    def fake_run_one_task(task, skills_folder, **kwargs):
+        return TaskOutcome(
+            task_id=task["task_id"], success=True, tool_calls=2,
+            elapsed_s=0.5, verified=True, verifier_status="passed",
+        )
+
+    monkeypatch.setattr(_ev, "_run_one_task", fake_run_one_task)
+    res = evaluate(skills, cascade=False, verify=False, repeats=1)
     assert res.per_task[0]["repeats_detail"] == []
 
 

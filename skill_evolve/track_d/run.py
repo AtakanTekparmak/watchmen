@@ -19,9 +19,9 @@ CLI:
       --out runs/track_d_<ts>/ \\
       --b-generations 10 \\
       --a-max-passes 8 \\
-      [--outer-model anthropic/claude-sonnet-4.6] \\
+      [--outer-model moonshotai/kimi-k2.6] \\
       [--inner-model minimax/minimax-m2.7] \\
-      [--max-workers 7] [--repeats 1] [--sources tblite]
+      [--max-workers 7] [--repeats 3] [--sources tblite]
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ from skill_evolve.track_b.openevolve_skills.prompt_sampler import PromptSampler
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OUTER_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_OUTER_MODEL = "moonshotai/kimi-k2.6"
 DEFAULT_INNER_MODEL = "minimax/minimax-m2.7"
 DEFAULT_B_GENERATIONS = 10
 DEFAULT_A_MAX_PASSES = 8
@@ -272,7 +272,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--migration-interval", type=int, default=5)
     p.add_argument("--rng-seed", type=int, default=0)
     p.add_argument("--max-workers", type=int, default=1)
-    p.add_argument("--repeats", type=int, default=1)
+    p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--sources", nargs="*", default=None)
     p.add_argument("--outer-model", default=DEFAULT_OUTER_MODEL)
     p.add_argument("--inner-model", default=DEFAULT_INNER_MODEL)

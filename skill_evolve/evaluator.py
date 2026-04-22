@@ -647,7 +647,7 @@ def evaluate(
     extra_run_agent_args: Sequence[str] = (),
     force_synthetic: bool = False,
     verify: bool = True,
-    repeats: int = 1,
+    repeats: int = 3,
 ) -> EvalResult:
     """Score a candidate skills folder.
 
@@ -907,7 +907,7 @@ def _cli() -> int:
     ap.add_argument(
         "--repeats",
         type=int,
-        default=1,
+        default=3,
         help="k repeat roll-outs per task for majority-vote aggregation (default: 1).",
     )
     ap.add_argument(

@@ -38,7 +38,7 @@ from .controller import RunConfig, run_evolution
 # Asymmetric model defaults: Sonnet 4.6 for the outer/meta LLM
 # (tournament — critic / op-planner / body-writer / synthesizer) and
 # M2.7 for the inner Hermes agent rollouts inside SkillFolderEvaluator.
-DEFAULT_OUTER_MODEL = "anthropic/claude-sonnet-4.6"
+DEFAULT_OUTER_MODEL = "moonshotai/kimi-k2.6"
 DEFAULT_INNER_MODEL = "minimax/minimax-m2.7"
 
 
@@ -74,7 +74,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--repeats",
         type=int,
-        default=1,
+        default=3,
         help="k repeat roll-outs per task in each evaluation "
         "for majority-vote aggregation (default: 1).",
     )
