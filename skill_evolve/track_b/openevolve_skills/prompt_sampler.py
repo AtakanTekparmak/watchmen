@@ -14,19 +14,33 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from .database import Program, cell_key, compute_features, FEATURE_DIMENSIONS
-from .folder_artifact import FolderArtifact
+from .folder_artifact import FolderArtifact, MAX_FILES, MAX_TOTAL_BYTES
 
 
 SYSTEM_TEMPLATE = """\
-You are evolving a *folder of Hermes-agent skills*. Each skill is a
-subfolder containing a single `SKILL.md` file with YAML frontmatter
-(name, description, version, tags) and a markdown body.
+You are evolving a *folder of Hermes-agent skills*. Each skill lives
+in its own subdirectory. A skill's directory contains:
+
+  * `SKILL.md` (required) — YAML frontmatter (name, description,
+    version, tags) + a prose body the agent reads before acting.
+  * `scripts/` (optional) — executable helpers (`.sh` with shebang,
+    `.py` with shebang) the agent invokes from inside its task
+    container to do heavy lifting. Bash / python only; no binaries.
+  * `references/` (optional) — supporting docs, specs, examples.
+  * `templates/` (optional) — output-format boilerplate.
+  * `assets/` (optional) — supplementary static files.
+
+Scripts under `scripts/` are written out with the executable bit set,
+so SKILL.md prose can tell the agent to `bash scripts/analyze.sh
+<args>` from the task workspace (mounted at `/app` in the task
+container).
 
 Your goal: produce a *mutation* of the parent folder that scores higher
 on the composite fitness metric (success_rate minus a small tool-call
 overhead penalty) on the benchmark. Focus on things that actually
 change agent behavior — clearer triggers, better boundaries, cutting
-dead weight, fixing a failure mode surfaced in the feedback.
+dead weight, fixing a failure mode surfaced in the feedback, or
+adding/fixing a script that short-circuits repeated agent work.
 
 You MUST reply using the patch format described in the user message.
 Reply with the patch only — no explanation, no surrounding prose,
@@ -62,30 +76,54 @@ Skills that were present but NEVER invoked by the agent:
 ## How to reply
 
 Emit zero or more of these commands. Each command operates on one file.
+Paths are interpreted under the skills-folder root, so a script at
+`<skill>/scripts/foo.sh` is written as `my_skill/scripts/foo.sh`.
 
-    <<<ADD_FILE path/to/new_skill/SKILL.md>>>
+    <<<ADD_FILE my_skill/SKILL.md>>>
     ---
-    name: ...
-    description: ...
+    name: my_skill
+    description: One-line trigger for when the agent should use this skill.
     ---
 
-    # markdown body
+    # My Skill
+
+    Prose the agent reads before acting. Reference helpers as
+    `bash scripts/analyze.sh <path>` so the agent knows to invoke them.
     <<<END_FILE>>>
 
-    <<<EDIT_FILE path/to/existing/SKILL.md>>>
-    <entire new contents>
+    <<<ADD_FILE my_skill/scripts/analyze.sh>>>
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="${{1:-/app}}"
+    # ... do the thing ...
     <<<END_FILE>>>
 
-    <<<DELETE_FILE path/to/stale/SKILL.md>>>
+    <<<EDIT_FILE my_skill/scripts/analyze.sh>>>
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # entire rewritten body, shebang included
+    <<<END_FILE>>>
+
+    <<<DELETE_FILE my_skill/scripts/stale_helper.sh>>>
 
 Constraints:
-* ≤ {max_files} files total in the resulting folder
-* ≤ {max_kb} KiB total across all files
+* <= {max_files} files total in the resulting folder
+* <= {max_kb} KiB total across all files
 * Every skill must live in its own subfolder containing `SKILL.md`
 * At least one skill must remain after the patch
 * Do NOT use `..` in paths
+* New scripts MUST start with a shebang: `#!/usr/bin/env bash` followed
+  by `set -euo pipefail` for bash, or `#!/usr/bin/env python3` for
+  python. Executable bit is set automatically for `.sh` / `.py` files
+  under any skill's `scripts/` subdir.
+* SKILL.md YAML frontmatter must parse (the validator rejects patches
+  that produce broken frontmatter — quote descriptions containing `:`).
 
-Focus on the single most promising change, not a rewrite.
+Focus on the single most promising change, not a rewrite. Prefer
+adding/editing a script when the failure is the agent re-implementing
+the same 10-20 lines of shell / python across tasks. Prefer editing
+SKILL.md prose when the failure is the agent not invoking the right
+skill, or invoking it at the wrong time.
 """
 
 
@@ -98,7 +136,12 @@ class RenderedPrompt:
 class PromptSampler:
     """Assemble a prompt for a folder-mutation LLM call."""
 
-    def __init__(self, *, max_files: int = 20, max_total_bytes: int = 100 * 1024) -> None:
+    def __init__(
+        self,
+        *,
+        max_files: int = MAX_FILES,
+        max_total_bytes: int = MAX_TOTAL_BYTES,
+    ) -> None:
         self.max_files = max_files
         self.max_total_bytes = max_total_bytes
 
