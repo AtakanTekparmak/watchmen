@@ -136,11 +136,37 @@ seed_skills/          # Claude-written 5-skill seed (baseline)
 seed_skills_empty/    # 1-skill placeholder for ablation
 seed_skills_realworld/# OSS 5-skill seed (obra/superpowers + hermes shipped + ...)
 
+# Skills-with-code ablation seeds (Phase 4; scripts+prose, hermes-native subdirs)
+seed_skills_empty_code/ # E1: 1 placeholder skill, no scripts (code-allowed baseline)
+seed_skills_1_code/     # E2: 1 upstream skill with script (obra systematic-debugging)
+seed_skills_5_code/     # E3: 5 upstream skills (systematic-debugging, verification-before-completion, analyzing-persistence-mechanisms-in-linux, mcp-builder, webapp-testing)
+
 results.md            # Running write-up of all evolution runs
 logs.md               # Hourly check-in log across runs
 NEXT_STEPS.md         # Current priorities
 runs/                 # Per-run artifacts (gitignored)
 ```
+
+## Skills-with-code seeds (Phase 4)
+
+Three additional seed folders feed the skills-with-code ablation, where
+skills may ship executable helpers alongside their `SKILL.md`. All three
+use hermes-native subdirs (`scripts/`, `references/`, `templates/`,
+`assets/`) and round-trip through `SkillFolder` + `FolderArtifact`.
+
+- **`seed_skills_empty_code/`** (E1) — single placeholder skill, no
+  scripts. "Code allowed but none provided" baseline.
+- **`seed_skills_1_code/`** (E2) — `systematic-debugging` from
+  [obra/superpowers](https://github.com/obra/superpowers) (MIT) with
+  the verbatim `find-polluter.sh` bisection helper.
+- **`seed_skills_5_code/`** (E3) — five upstream SWE skills covering
+  bug-hunting, pre-ship verification, Linux persistence scanning, MCP
+  server authoring, and Playwright webapp testing. Sourced from
+  obra/superpowers (MIT), mukul975/Anthropic-Cybersecurity-Skills
+  (Apache-2.0), and anthropics/skills (Apache-2.0). Each skill carries
+  `source_url:` and `license:` in its SKILL.md frontmatter;
+  `verification-before-completion` is prose-only upstream and is
+  flagged `source: upstream-prose-only`.
 
 ## Tests
 

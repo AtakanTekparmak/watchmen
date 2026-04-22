@@ -76,7 +76,10 @@ def run_evolution(
     # dropped every .sh / .py / .jq in the seed — see LOGIC_GAPS.md.
     base_artifact = FolderArtifact.from_path(
         seed_path,
-        include_exts={".md", ".sh", ".py", ".jq", ".json", ".yaml", ".yml", ".txt"},
+        include_exts={
+            ".md", ".sh", ".py", ".jq",
+            ".json", ".yaml", ".yml", ".txt", ".xml",
+        },
     )
     base_artifact.validate()
     variants = seed_variants(base_artifact, num_islands=config.num_islands)
