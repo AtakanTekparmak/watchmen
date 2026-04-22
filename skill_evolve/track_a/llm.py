@@ -106,6 +106,23 @@ SYNTHETIC_CANNED = {
     "synth": (
         '{"skills": []}'
     ),
+    "new_script": (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "\n"
+        "# Synthetic-mode placeholder script. Writes a marker to the first\n"
+        "# positional argument (default /app/probe.txt) and exits 0.\n"
+        "OUT=\"${1:-/app/probe.txt}\"\n"
+        "echo \"ok $(date -Iseconds)\" > \"$OUT\"\n"
+    ),
+    "rewrite_script": (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "\n"
+        "# Synthetic rewrite_script placeholder. Preserves the path, adds\n"
+        "# a minimal shebang + exit-on-error guard.\n"
+        "exit 0\n"
+    ),
 }
 
 

@@ -30,6 +30,18 @@ import yaml
 
 FRONTMATTER_FENCE = "---"
 
+# Hermes-agent recognises these 4 subdirs inside a skill folder and
+# exposes their files to the agent via ``skill_view(name, file_path=...)``.
+# Matches hermes-agent/tools/skills_tool.py:981-987. kai-skills mirrors
+# the same convention so evolved skills work unchanged inside hermes.
+AUX_SUBDIRS: tuple[str, ...] = ("scripts", "references", "templates", "assets")
+
+# File extensions that should be materialized with the executable bit
+# set (relative to their parent skill dir). Only applies to files under
+# ``scripts/`` — other subdirs (references/templates/assets) are read-only
+# data and stay 0644.
+EXECUTABLE_EXTS: frozenset[str] = frozenset({".sh", ".py"})
+
 
 @dataclass
 class SkillDoc:
@@ -37,11 +49,20 @@ class SkillDoc:
 
     ``folder_name`` is the directory that contains the SKILL.md — it must
     equal ``frontmatter['name']`` for the folder to validate.
+
+    ``auxiliary_files`` holds sibling files under ``scripts/``,
+    ``references/``, ``templates/``, or ``assets/`` subdirs of the skill
+    dir. Keys are POSIX relpaths under the skill root (e.g.
+    ``"scripts/hello.sh"``). Values are UTF-8 text contents. We restrict
+    to hermes's recognised subdirs so other stray directories don't get
+    mistaken for the skill's own code; binary files are not supported
+    (they can't round-trip through the text artifact serialization).
     """
 
     folder_name: str
     frontmatter: Dict[str, Any]
     body: str
+    auxiliary_files: Dict[str, str] = field(default_factory=dict)
 
     @property
     def name(self) -> str:
@@ -77,6 +98,7 @@ class SkillDoc:
             folder_name=self.folder_name,
             frontmatter=copy.deepcopy(self.frontmatter),
             body=self.body,
+            auxiliary_files=dict(self.auxiliary_files),
         )
 
 
@@ -101,7 +123,27 @@ class SkillFolder:
             skill_md = child / "SKILL.md"
             if not skill_md.exists():
                 continue
-            skills.append(_parse_skill_md(child.name, skill_md.read_text(encoding="utf-8")))
+            doc = _parse_skill_md(
+                child.name, skill_md.read_text(encoding="utf-8"),
+            )
+            # Load auxiliary files from the 4 hermes-native subdirs.
+            # Non-recognised subdirs are ignored so a ``tests/`` or
+            # ``draft/`` dir doesn't land in auxiliary_files.
+            for sub in AUX_SUBDIRS:
+                sub_dir = child / sub
+                if not sub_dir.is_dir():
+                    continue
+                for aux in sorted(sub_dir.rglob("*")):
+                    if not aux.is_file():
+                        continue
+                    rel = aux.relative_to(child).as_posix()
+                    try:
+                        content = aux.read_text(encoding="utf-8")
+                    except UnicodeDecodeError:
+                        # Skip binaries — text-only artifact invariant.
+                        continue
+                    doc.auxiliary_files[rel] = content
+            skills.append(doc)
         return cls(skills=skills, source_path=path)
 
     # ------------- mutation ---------------------------------------------
@@ -151,12 +193,30 @@ class SkillFolder:
             sdir = dest / s.folder_name
             sdir.mkdir(parents=True)
             (sdir / "SKILL.md").write_text(s.render(), encoding="utf-8")
+            for rel, content in s.auxiliary_files.items():
+                target = sdir / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+                # Scripts under scripts/ with a recognised executable
+                # extension get +x so the agent can ``bash`` / ``python3``
+                # them directly. Other aux files (refs/templates/assets)
+                # stay 0644.
+                if (
+                    rel.startswith("scripts/")
+                    and target.suffix in EXECUTABLE_EXTS
+                ):
+                    target.chmod(0o755)
         return dest
 
     # ------------- introspection ----------------------------------------
 
     def total_bytes(self) -> int:
-        return sum(len(s.render().encode("utf-8")) for s in self.skills)
+        total = 0
+        for s in self.skills:
+            total += len(s.render().encode("utf-8"))
+            for content in s.auxiliary_files.values():
+                total += len(content.encode("utf-8"))
+        return total
 
     def render_summary(self, *, body_chars: int = 1200) -> str:
         """Compact human/LLM-readable render of the whole folder.
@@ -169,10 +229,20 @@ class SkillFolder:
             body = s.body.strip()
             if len(body) > body_chars:
                 body = body[:body_chars].rstrip() + "\n...[truncated]"
+            aux_line = ""
+            if s.auxiliary_files:
+                # Show auxiliary paths (not contents) so outer prompts
+                # know scripts/refs exist and can choose to mutate them.
+                aux_line = (
+                    "auxiliary_files: "
+                    + ", ".join(sorted(s.auxiliary_files.keys()))
+                    + "\n"
+                )
             parts.append(
                 f"### skill: {s.folder_name}\n"
                 f"name: {s.name}\n"
-                f"description: {s.description}\n\n"
+                f"description: {s.description}\n"
+                f"{aux_line}\n"
                 f"{body}\n"
             )
         if not parts:

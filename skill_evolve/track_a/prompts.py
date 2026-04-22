@@ -24,14 +24,26 @@ from __future__ import annotations
 
 DESCRIBE_GOAL = (
     "You are editing a folder of Hermes-agent SKILL.md files. Each skill "
-    "is a markdown document with YAML frontmatter (name, description, "
-    "version, author, license, metadata) followed by a prose body the "
-    "agent reads before acting. The folder is consumed by an autonomous "
-    "agent working on terminal-bench (shell / file-ops tasks) and "
-    "SWE-bench Verified (bug-fix patches on real Python projects). The "
-    "agent's score is the fraction of benchmark tasks it passes, lightly "
-    "penalized for tool-call overhead. Skills are loaded on demand; they "
-    "must be concrete, actionable, and non-overlapping."
+    "lives in its own subdirectory. A skill's directory contains:\n"
+    "  * SKILL.md (required) — YAML frontmatter (name, description, "
+    "version, tags) + a prose body the agent reads before acting.\n"
+    "  * scripts/ (optional) — executable helpers (.sh with shebang, "
+    ".py with shebang) the agent can invoke from inside its task "
+    "container to do heavy lifting. Bash/python only; no binaries.\n"
+    "  * references/ (optional) — supporting docs / specs / examples.\n"
+    "  * templates/ (optional) — output-format boilerplate.\n"
+    "  * assets/ (optional) — supplementary static files.\n"
+    "Hermes exposes each of these to the agent via "
+    "`skill_view(name, file_path=...)`. Scripts under scripts/ are mounted "
+    "into the task container with the executable bit set, so prose in "
+    "SKILL.md can tell the agent things like: 'run scripts/analyze.sh "
+    "with /app/input.txt as arg'.\n\n"
+    "The folder is consumed by an autonomous agent working on "
+    "terminal-bench (shell / file-ops tasks) and SWE-bench Verified "
+    "(bug-fix patches on real Python projects). The agent's score is "
+    "the fraction of benchmark tasks it passes, lightly penalized for "
+    "tool-call overhead. Skills are loaded on demand; they must be "
+    "concrete, actionable, and non-overlapping."
 )
 
 
@@ -313,6 +325,102 @@ Choose exactly ONE of the following operators:
 problems that don't require structural change.
     args: {{"op": "RewriteSkillContent", "name": "<dir-name>", "critique_excerpt": "<the lines of the critique that apply>"}}
 
+  * AddScript        — add a new executable helper under <skill>/scripts/. \
+Use when the agent repeatedly re-implements the same shell or python logic \
+across tasks and a single reusable script would cut turns. Path MUST start \
+with `scripts/` and end in `.sh` or `.py` (shebang will be auto-added if \
+missing).
+    args: {{"op": "AddScript", "skill": "<dir-name>", "path": "scripts/<name>.sh", "purpose": "<1-3 sentence rationale: what the script does and when the agent invokes it>"}}
+
+  * RewriteScript    — rewrite an existing script. Use when a script is \
+present but wrong, brittle, or missing functionality the critique flags.
+    args: {{"op": "RewriteScript", "skill": "<dir-name>", "path": "scripts/<name>.sh", "critique_excerpt": "<relevant critique lines>"}}
+
+  * RemoveScript     — delete a script that's never invoked, actively \
+harmful, or superseded. Keep this rare — the prose usually needs to change \
+too so the agent stops referencing it.
+    args: {{"op": "RemoveScript", "skill": "<dir-name>", "path": "scripts/<name>.sh"}}
+
 Respond with a single JSON object matching one of the arg schemas above. \
 No prose, no markdown fences, no trailing commas.
 """
+
+
+# ---------------------------------------------------------------------------
+# Author — script bodies (AddScript / RewriteScript).
+# ---------------------------------------------------------------------------
+
+AUTHOR_SCRIPT_SYSTEM = (
+    "You are an expert author of short, robust executable helpers for an "
+    "autonomous agent. You write bash and Python scripts that do ONE "
+    "thing well, print useful diagnostics, exit non-zero on failure, and "
+    "can be invoked cleanly by an LLM-driven agent from a Docker "
+    "container. You never write long frameworks — keep scripts under "
+    "~150 lines. You always include a leading shebang. For bash: "
+    "`#!/usr/bin/env bash` + `set -euo pipefail`. For python: "
+    "`#!/usr/bin/env python3`. You write only the script content — no "
+    "prose before or after, no markdown fences."
+)
+
+NEW_SCRIPT_PROMPT = """\
+{goal}
+
+You are adding a new executable helper to the skill `{skill_name}`.
+
+### skill's current description
+{skill_description}
+
+### skill's current prose body (excerpt)
+{skill_body}
+
+### script to create
+Path: {path}
+Purpose: {purpose}
+
+Rules:
+
+  * Path is interpreted relative to the skill directory. The file will \
+end up at `<skill>/{path}` inside the task container with +x set.
+  * The agent invokes this script via the terminal toolset. The task's \
+workspace is mounted at `/app`; inputs / outputs live there. Your script \
+must accept a task-specific argument (file path, directory, etc.) or \
+default sensibly.
+  * Include a leading shebang. Bash: `#!/usr/bin/env bash` + `set -euo \
+pipefail`. Python: `#!/usr/bin/env python3`.
+  * Exit 0 on success, non-zero on failure. Print short diagnostics to \
+stderr for failures so the agent can react.
+  * No external package installs (no `pip install`, no `apt-get`). \
+Stick to stdlib + standard unix utilities the task container already has.
+  * Keep it under ~150 lines. If the logic is bigger than that, split \
+into smaller scripts or reconsider the skill shape.
+
+Write ONLY the script's content. No prose, no markdown fences."""
+
+REWRITE_SCRIPT_PROMPT = """\
+{goal}
+
+You are rewriting one existing script in a skill. The critique flagged \
+concrete problems; fix them.
+
+### skill: {skill_name}
+### path: {path}
+
+### current script content
+```
+{current_content}
+```
+
+### critique excerpt
+{critique}
+
+Rules for the rewrite:
+
+  * Same path, same language (don't rewrite a .sh as .py or vice versa).
+  * Preserve shebang and `set -euo pipefail` (bash) or `#!/usr/bin/env \
+python3` (python).
+  * Only change what the critique calls out — don't drift on working \
+behavior.
+  * No external package installs. Stick to stdlib + standard unix tools.
+
+Write ONLY the new script content. No prose, no markdown fences, no \
+diff — the full file."""

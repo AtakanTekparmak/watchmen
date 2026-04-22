@@ -32,12 +32,15 @@ from .folder import SkillDoc, SkillFolder, make_skill_doc
 from .llm import LLMClient
 from .prompts import (
     AUTHOR_B_SYSTEM,
+    AUTHOR_SCRIPT_SYSTEM,
     DESCRIBE_GOAL,
     MERGE_PROMPT,
     NEW_BODY_PROMPT,
+    NEW_SCRIPT_PROMPT,
     OP_PLANNER_PROMPT,
     OP_PLANNER_SYSTEM,
     REWRITE_BODY_PROMPT,
+    REWRITE_SCRIPT_PROMPT,
     SPLIT_PROMPT,
 )
 
@@ -215,6 +218,149 @@ def apply_merge_skills(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Script operators (Phase 2, 2026-04-22)
+# ---------------------------------------------------------------------------
+
+_SCRIPT_EXT_SHEBANG = {
+    ".sh": "#!/usr/bin/env bash\nset -euo pipefail\n",
+    ".py": "#!/usr/bin/env python3\n",
+}
+
+
+def _validate_script_path(path: str) -> str:
+    """Gate for AddScript / RewriteScript / RemoveScript paths.
+
+    Must be POSIX-relative, under ``scripts/``, and use a recognised
+    executable extension. No traversal, no absolute paths.
+    """
+    if not isinstance(path, str) or not path:
+        raise ValueError("script path must be a non-empty string")
+    if path.startswith("/") or ".." in path.split("/"):
+        raise ValueError(f"script path must be relative and traversal-free: {path!r}")
+    parts = path.split("/")
+    if parts[0] != "scripts" or len(parts) < 2 or parts[-1] == "":
+        raise ValueError(
+            f"script path must start with 'scripts/' and name a file, got {path!r}"
+        )
+    suffix = path[path.rfind("."):] if "." in parts[-1] else ""
+    if suffix not in _SCRIPT_EXT_SHEBANG:
+        raise ValueError(
+            f"script path must end in .sh or .py, got {path!r}"
+        )
+    return path
+
+
+def _ensure_shebang(path: str, content: str) -> str:
+    """Prefix a shebang if the content doesn't already start with one.
+
+    LLMs reliably forget shebangs on .py and occasionally on .sh; a
+    missing shebang means the agent has to know to invoke via
+    ``python3`` / ``bash``. Cheap insurance.
+    """
+    if content.startswith("#!"):
+        return content
+    suffix = path[path.rfind("."):]
+    header = _SCRIPT_EXT_SHEBANG.get(suffix, "")
+    return header + content if header else content
+
+
+def apply_add_script(
+    folder: SkillFolder,
+    client: LLMClient,
+    *,
+    skill: str,
+    path: str,
+    purpose: str,
+) -> SkillFolder:
+    out = folder.clone()
+    doc = out.by_name(skill)
+    if not doc:
+        raise KeyError(f"AddScript: skill '{skill}' not in folder")
+    _validate_script_path(path)
+    if path in doc.auxiliary_files:
+        raise ValueError(
+            f"AddScript: '{path}' already exists in skill '{skill}'; "
+            "use RewriteScript instead"
+        )
+    raw = client.complete(
+        AUTHOR_SCRIPT_SYSTEM,
+        NEW_SCRIPT_PROMPT.format(
+            goal=DESCRIBE_GOAL,
+            skill_name=skill,
+            skill_description=doc.description,
+            skill_body=doc.body[:1500],
+            path=path,
+            purpose=purpose,
+        ),
+        tag="new_script",
+        max_tokens=2000,
+    ).strip()
+    # Strip accidental fences (LLMs do this even when told not to).
+    raw = _JSON_FENCE.sub("", raw).strip()
+    doc.auxiliary_files[path] = _ensure_shebang(path, raw) + (
+        "\n" if not raw.endswith("\n") else ""
+    )
+    return out
+
+
+def apply_rewrite_script(
+    folder: SkillFolder,
+    client: LLMClient,
+    *,
+    skill: str,
+    path: str,
+    critique: str,
+) -> SkillFolder:
+    out = folder.clone()
+    doc = out.by_name(skill)
+    if not doc:
+        raise KeyError(f"RewriteScript: skill '{skill}' not in folder")
+    _validate_script_path(path)
+    if path not in doc.auxiliary_files:
+        raise KeyError(
+            f"RewriteScript: '{path}' not in skill '{skill}'"
+        )
+    current = doc.auxiliary_files[path]
+    raw = client.complete(
+        AUTHOR_SCRIPT_SYSTEM,
+        REWRITE_SCRIPT_PROMPT.format(
+            goal=DESCRIBE_GOAL,
+            skill_name=skill,
+            path=path,
+            current_content=current,
+            critique=critique or "(no critique provided)",
+        ),
+        tag="rewrite_script",
+        max_tokens=2000,
+    ).strip()
+    raw = _JSON_FENCE.sub("", raw).strip()
+    doc.auxiliary_files[path] = _ensure_shebang(path, raw) + (
+        "\n" if not raw.endswith("\n") else ""
+    )
+    return out
+
+
+def apply_remove_script(
+    folder: SkillFolder,
+    client: LLMClient,
+    *,
+    skill: str,
+    path: str,
+) -> SkillFolder:
+    out = folder.clone()
+    doc = out.by_name(skill)
+    if not doc:
+        raise KeyError(f"RemoveScript: skill '{skill}' not in folder")
+    _validate_script_path(path)
+    if path not in doc.auxiliary_files:
+        raise KeyError(
+            f"RemoveScript: '{path}' not in skill '{skill}'"
+        )
+    del doc.auxiliary_files[path]
+    return out
+
+
 def apply_rewrite_content(
     folder: SkillFolder,
     client: LLMClient,
@@ -358,6 +504,59 @@ def _coerce_op_record(parsed: Optional[Dict[str, Any]], folder: SkillFolder) -> 
             return None
         return OpRecord(op, {"name": name, "critique_excerpt": excerpt})
 
+    if op == "AddScript":
+        skill = parsed.get("skill")
+        path = parsed.get("path")
+        purpose = parsed.get("purpose", "")
+        if not isinstance(skill, str) or skill not in valid_names:
+            return None
+        if not isinstance(path, str):
+            return None
+        try:
+            _validate_script_path(path)
+        except ValueError:
+            return None
+        # Collision check: AddScript must not target an existing path.
+        doc = folder.by_name(skill)
+        if doc is not None and path in doc.auxiliary_files:
+            return None
+        return OpRecord(op, {"skill": skill, "path": path, "purpose": purpose})
+
+    if op == "RewriteScript":
+        skill = parsed.get("skill")
+        path = parsed.get("path")
+        excerpt = parsed.get("critique_excerpt", "")
+        if not isinstance(skill, str) or skill not in valid_names:
+            return None
+        if not isinstance(path, str):
+            return None
+        try:
+            _validate_script_path(path)
+        except ValueError:
+            return None
+        doc = folder.by_name(skill)
+        if doc is None or path not in doc.auxiliary_files:
+            return None
+        return OpRecord(
+            op, {"skill": skill, "path": path, "critique_excerpt": excerpt}
+        )
+
+    if op == "RemoveScript":
+        skill = parsed.get("skill")
+        path = parsed.get("path")
+        if not isinstance(skill, str) or skill not in valid_names:
+            return None
+        if not isinstance(path, str):
+            return None
+        try:
+            _validate_script_path(path)
+        except ValueError:
+            return None
+        doc = folder.by_name(skill)
+        if doc is None or path not in doc.auxiliary_files:
+            return None
+        return OpRecord(op, {"skill": skill, "path": path})
+
     return None
 
 
@@ -429,5 +628,22 @@ def apply_op(
             name=a["name"],
             critique=critique or a.get("critique_excerpt", ""),
             skill_failures=skill_failures,
+        )
+    if name == "AddScript":
+        return apply_add_script(
+            folder, client,
+            skill=a["skill"], path=a["path"],
+            purpose=a.get("purpose", ""),
+        )
+    if name == "RewriteScript":
+        return apply_rewrite_script(
+            folder, client,
+            skill=a["skill"], path=a["path"],
+            critique=critique or a.get("critique_excerpt", ""),
+        )
+    if name == "RemoveScript":
+        return apply_remove_script(
+            folder, client,
+            skill=a["skill"], path=a["path"],
         )
     raise ValueError(f"unknown op: {name}")

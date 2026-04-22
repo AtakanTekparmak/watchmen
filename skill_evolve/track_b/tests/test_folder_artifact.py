@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 
 import pytest
@@ -176,3 +177,45 @@ def test_validate_only_checks_skill_md_files():
         "INDEX.md": "random: text: with: colons: everywhere:\n",
     })
     art.validate()  # no raise
+
+
+# --- Phase 1: exec-bit preservation on scripts/ (added 2026-04-22) -------
+
+def test_write_to_sets_exec_bit_on_scripts(tmp_path: Path) -> None:
+    """FolderArtifact.write_to chmods +x on <skill>/scripts/*.sh|*.py so
+    the agent can invoke them from inside the container. Refs /
+    templates / assets files must stay 0644.
+    """
+    art = FolderArtifact(files={
+        "alpha/SKILL.md": "---\nname: alpha\ndescription: d\n---\nbody\n",
+        "alpha/scripts/run.sh": "#!/bin/sh\necho ok\n",
+        "alpha/scripts/helper.py": "#!/usr/bin/env python3\nprint('ok')\n",
+        "alpha/references/doc.md": "# doc\n",
+        "alpha/assets/data.json": '{"k": "v"}\n',
+    })
+    art.write_to(tmp_path)
+
+    sh = tmp_path / "alpha" / "scripts" / "run.sh"
+    py = tmp_path / "alpha" / "scripts" / "helper.py"
+    ref = tmp_path / "alpha" / "references" / "doc.md"
+    asset = tmp_path / "alpha" / "assets" / "data.json"
+
+    assert sh.stat().st_mode & stat.S_IXUSR
+    assert py.stat().st_mode & stat.S_IXUSR
+    assert not (ref.stat().st_mode & stat.S_IXUSR)
+    assert not (asset.stat().st_mode & stat.S_IXUSR)
+
+
+def test_write_to_does_not_exec_non_script_subdir_sh(tmp_path: Path) -> None:
+    """A .sh file outside ``scripts/`` (e.g. under ``assets/`` or top-
+    level) must NOT get +x — only ``scripts/`` is the convention."""
+    art = FolderArtifact(files={
+        "alpha/SKILL.md": "---\nname: alpha\ndescription: d\n---\nbody\n",
+        "alpha/assets/install.sh": "#!/bin/sh\n",
+    })
+    art.write_to(tmp_path)
+
+    assert not (
+        (tmp_path / "alpha" / "assets" / "install.sh").stat().st_mode
+        & stat.S_IXUSR
+    )

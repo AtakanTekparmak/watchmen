@@ -40,8 +40,12 @@ import yaml
 
 
 # Hard limits — tuned for skill folders. Override only in tests.
-MAX_FILES: int = 20
-MAX_TOTAL_BYTES: int = 100 * 1024  # 100 KiB
+MAX_FILES: int = 60  # Bumped from 20 on 2026-04-22 to accommodate
+#                      code-bearing skills (SKILL.md + scripts/ + refs
+#                      + templates + assets; 5-skill seed ~= 30 files).
+MAX_TOTAL_BYTES: int = 500 * 1024  # 500 KiB (bumped from 100 KiB for
+#                      the same reason; realworld SWE skill scripts
+#                      routinely hit 5-20 KiB each).
 # Serialize fence — chosen to be unlikely in any skill source.
 _FILE_FENCE = "===== FILE: {path} ====="
 _END_FENCE = "===== END FILE ====="
@@ -283,6 +287,16 @@ class FolderArtifact:
             dst = target / relpath
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_text(content, encoding="utf-8")
+            # Mirror track_a.folder.SkillFolder.write: executable bit on
+            # files under any skill's ``scripts/`` subdir with a
+            # recognised extension. Path pattern: ``<skill>/scripts/*.sh``.
+            parts = relpath.split("/")
+            if (
+                len(parts) >= 3
+                and parts[1] == "scripts"
+                and dst.suffix in {".sh", ".py"}
+            ):
+                dst.chmod(0o755)
         return target
 
     @classmethod

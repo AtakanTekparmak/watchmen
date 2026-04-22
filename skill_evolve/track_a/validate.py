@@ -20,7 +20,10 @@ from typing import List, Tuple
 
 from .folder import SkillFolder
 
-MAX_TOTAL_BYTES = 100 * 1024  # 100 KB
+MAX_TOTAL_BYTES = 500 * 1024  # 500 KiB (bumped from 100 KiB on 2026-04-22
+#                               for code-bearing skills with scripts/
+#                               subdirs; realworld SWE scripts are 5-20
+#                               KiB each, 5-skill seeds land ~30-50 KiB).
 MIN_SKILLS = 1
 MAX_SKILLS = 20
 
