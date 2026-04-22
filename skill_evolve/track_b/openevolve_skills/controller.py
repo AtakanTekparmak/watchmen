@@ -70,7 +70,14 @@ def run_evolution(
     history_path.write_text("", encoding="utf-8")
 
     # --- seed each island --------------------------------------------------
-    base_artifact = FolderArtifact.from_path(seed_path, include_exts={".md"})
+    # Include executable files alongside SKILL.md so code-bearing seeds
+    # (hermes's built-in subdirs: scripts/, references/, templates/,
+    # assets/) survive the load. Prior include_exts={".md"} silently
+    # dropped every .sh / .py / .jq in the seed — see LOGIC_GAPS.md.
+    base_artifact = FolderArtifact.from_path(
+        seed_path,
+        include_exts={".md", ".sh", ".py", ".jq", ".json", ".yaml", ".yml", ".txt"},
+    )
     base_artifact.validate()
     variants = seed_variants(base_artifact, num_islands=config.num_islands)
 

@@ -82,7 +82,12 @@ def run_evolution(
     rng = random.Random(config.rng_seed)
 
     # --- seed each island --------------------------------------------------
-    base_artifact = FolderArtifact.from_path(seed_path, include_exts={".md"})
+    # Include executable files alongside SKILL.md (see Track B controller
+    # for rationale + LOGIC_GAPS.md).
+    base_artifact = FolderArtifact.from_path(
+        seed_path,
+        include_exts={".md", ".sh", ".py", ".jq", ".json", ".yaml", ".yml", ".txt"},
+    )
     base_artifact.validate()
     variants = seed_variants(base_artifact, num_islands=config.num_islands)
 
