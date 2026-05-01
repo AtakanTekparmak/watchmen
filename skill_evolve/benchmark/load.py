@@ -188,11 +188,41 @@ def _hydrate_swebench(entry: Dict[str, Any]) -> Task:
     )
 
 
+def _hydrate_skillsbench(entry: Dict[str, Any]) -> Task:
+    """Hydrate a SkillsBench manifest entry into a :class:`Task`.
+
+    Resolves ``task_dir``: prefers an explicit ``task_dir`` field on the
+    entry; otherwise builds the canonical vendor path from
+    ``dataset_task_name``.
+    """
+    from . import skillsbench_loader  # local import to avoid cycles
+
+    if "task_dir" in entry and entry["task_dir"]:
+        task_dir = Path(entry["task_dir"])
+    else:
+        name = entry.get("dataset_task_name") or entry["task_id"].rsplit("/", 1)[-1]
+        task_dir = (
+            Path(__file__).resolve().parent / "vendor" / "skillsbench" / "tasks" / name
+        )
+    task = skillsbench_loader.hydrate_one(task_dir)
+    # Allow manifest entry to override timeout/stage/skill_relevance.
+    if "timeout_s" in entry:
+        task.timeout_s = int(entry["timeout_s"])
+    if "stage" in entry:
+        task.stage = int(entry["stage"])
+    if "skill_relevance" in entry:
+        task.skill_relevance = entry["skill_relevance"]
+    # Preserve the manifest task_id verbatim (in case someone aliases it).
+    task.task_id = entry.get("task_id", task.task_id)
+    return task
+
+
 def load_subset(
     *,
     offline_only: bool = False,
     sources: Optional[List[str]] = None,
     manifest_path: Optional[Path] = None,
+    task_ids: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Hydrate every entry in the manifest into a runnable task dict.
 
@@ -203,6 +233,12 @@ def load_subset(
         sources: optional whitelist (e.g. ``["tblite"]``) for cheap dev
             iteration when SWE-bench env isn't worth standing up.
         manifest_path: override the default manifest location.
+        task_ids: optional explicit allowlist of fully-qualified task
+            IDs (``"skillsbench/foo"``) or bare segments (``"foo"``).
+            When set, only matching manifest entries are hydrated. Used
+            by the Phase E SkillsBench dispatch (run.py ``--task-list``)
+            so evolution sees the curated hot-12 subset rather than the
+            full 10-task tblite manifest.
 
     Returns:
         list[dict] sorted by ``stage`` then by ``task_id``.
@@ -210,9 +246,24 @@ def load_subset(
     manifest = _read_manifest(manifest_path or _MANIFEST_PATH)
     tasks: List[Task] = []
 
+    # Build task_id allowlist (covers both fully-qualified and bare-segment
+    # spellings so callers can pass either form). Empty set == no filter.
+    id_allowlist: Optional[set[str]] = None
+    if task_ids:
+        id_allowlist = set()
+        for tid in task_ids:
+            id_allowlist.add(tid)
+            if "/" in tid:
+                id_allowlist.add(tid.rsplit("/", 1)[-1])
+
     for entry in manifest["tasks"]:
         if sources and entry["source"] not in sources:
             continue
+        if id_allowlist is not None:
+            entry_id = entry.get("task_id", "")
+            entry_bare = entry_id.rsplit("/", 1)[-1] if "/" in entry_id else entry_id
+            if entry_id not in id_allowlist and entry_bare not in id_allowlist:
+                continue
         if offline_only:
             tasks.append(
                 Task(
@@ -232,12 +283,16 @@ def load_subset(
                 tasks.append(_hydrate_tblite(entry))
             elif entry["source"] == "swebench":
                 tasks.append(_hydrate_swebench(entry))
+            elif entry["source"] == "skillsbench":
+                tasks.append(_hydrate_skillsbench(entry))
             else:
-                logger.warning("unknown source %s; skipping %s",
-                               entry["source"], entry.get("task_id"))
+                logger.warning(
+                    "unknown source %s; skipping %s",
+                    entry["source"],
+                    entry.get("task_id"),
+                )
         except Exception as exc:
-            logger.warning("hydration failed for %s: %s",
-                           entry.get("task_id"), exc)
+            logger.warning("hydration failed for %s: %s", entry.get("task_id"), exc)
 
     tasks.sort(key=lambda t: (t.stage, t.task_id))
     return [t.to_dict() for t in tasks]
@@ -247,15 +302,21 @@ if __name__ == "__main__":
     import argparse
 
     ap = argparse.ArgumentParser(description="Print hydrated benchmark subset.")
-    ap.add_argument("--offline", action="store_true",
-                    help="skip HF lookups; print just IDs/structure")
-    ap.add_argument("--sources", nargs="*", default=None,
-                    help="filter by source (tblite|swebench)")
+    ap.add_argument(
+        "--offline",
+        action="store_true",
+        help="skip HF lookups; print just IDs/structure",
+    )
+    ap.add_argument(
+        "--sources", nargs="*", default=None, help="filter by source (tblite|swebench)"
+    )
     args = ap.parse_args()
 
     tasks = load_subset(offline_only=args.offline, sources=args.sources)
     for t in tasks:
         prompt_preview = (t["prompt"] or "")[:80].replace("\n", " ")
-        print(f"[stage={t['stage']}] {t['task_id']:48s} "
-              f"timeout={t['timeout_s']}s :: {prompt_preview}")
+        print(
+            f"[stage={t['stage']}] {t['task_id']:48s} "
+            f"timeout={t['timeout_s']}s :: {prompt_preview}"
+        )
     print(f"\ntotal: {len(tasks)} tasks")

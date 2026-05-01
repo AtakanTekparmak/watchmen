@@ -320,6 +320,7 @@ def _run_one_task(
     enabled_toolsets: str,
     extra_run_agent_args: Sequence[str] = (),
     verify: bool = True,
+    keep_sandbox: bool = False,
 ) -> TaskOutcome:
     """Run a single benchmark task in its own sandbox + subprocess.
 
@@ -337,7 +338,7 @@ def _run_one_task(
     rid = f"{task['task_id'].replace('/', '_')}-{uuid.uuid4().hex[:6]}"
     started = time.monotonic()
 
-    with sandbox(skills_folder, run_id=rid) as h:
+    with sandbox(skills_folder, run_id=rid, keep_on_exit=keep_sandbox) as h:
         # Stage the workspace *before* the agent starts. For TBLite this
         # pulls /app out of the task container; for SWE-bench it clones the
         # repo at base_commit. The agent runs with cwd = workspace so its
@@ -644,10 +645,13 @@ def evaluate(
     max_turns: int = DEFAULT_MAX_TURNS,
     enabled_toolsets: str = DEFAULT_ENABLED_TOOLSETS,
     sources: Optional[List[str]] = None,
+    task_ids: Optional[List[str]] = None,
+    agent_backend: Optional[str] = None,
     extra_run_agent_args: Sequence[str] = (),
     force_synthetic: bool = False,
     verify: bool = True,
     repeats: int = 3,
+    keep_sandbox: bool = False,
 ) -> EvalResult:
     """Score a candidate skills folder.
 
@@ -659,6 +663,20 @@ def evaluate(
         max_turns: per-task tool-iteration cap.
         enabled_toolsets: comma-separated toolset list.
         sources: filter benchmark sources (e.g. ``["tblite"]``).
+        task_ids: optional allowlist of task IDs (fully qualified or
+            bare segment). Forwarded to :func:`load_subset`. Used by
+            Phase E SkillsBench dispatch so evolution operates on the
+            hot-12 subset rather than the default tblite section of
+            the manifest.
+        agent_backend: name of the agent backend to dispatch each
+            per-task call to. ``"hermes"`` (default when ``None``)
+            preserves the legacy ``_run_one_task`` flow unchanged
+            (tblite/swebench paths). ``"bench-cli"`` shells out to
+            :class:`skill_evolve.agents.bench_cli.BenchCliBackend` for
+            SkillsBench tasks (whose ``success_check_payload`` doesn't
+            carry the ``docker_image`` Hermes expects). Resolved via
+            :func:`skill_evolve.agents.get_backend`. Unknown values
+            raise.
         extra_run_agent_args: extra CLI args appended to run_agent.py.
         force_synthetic: emit a synthetic result even if keys are present.
         verify: run the real pass/fail verifiers (test.sh / swebench
@@ -678,10 +696,15 @@ def evaluate(
     if not skills_folder_path.is_dir():
         raise FileNotFoundError(skills_folder_path)
 
+    if agent_backend is not None and agent_backend not in ("hermes", "bench-cli"):
+        raise ValueError(
+            f"unknown agent_backend: {agent_backend!r} (known: 'hermes', 'bench-cli')"
+        )
+
     # Hydrate offline first (cheap) so we have something to summarize even
     # if HF lookups fail, then upgrade to full hydration when keys exist.
     online = have_live_keys() and not force_synthetic
-    tasks = load_subset(offline_only=not online, sources=sources)
+    tasks = load_subset(offline_only=not online, sources=sources, task_ids=task_ids)
 
     if not online:
         return _synthetic_result(
@@ -704,6 +727,56 @@ def evaluate(
         or "anthropic/claude-sonnet-4.6"
     )
 
+    # Resolve the agent backend once; every per-task call dispatches
+    # through this object. ``None`` defaults to the historical Hermes
+    # path so the tblite manifest stays bit-identical. Bench-cli is
+    # selected by Phase E for SkillsBench tasks (whose payloads lack
+    # the ``docker_image`` field Hermes expects).
+    from skill_evolve.agents import get_backend
+
+    backend_name = agent_backend or "hermes"
+    backend = get_backend(backend_name)
+
+    def _dispatch(task: Dict[str, Any]) -> TaskOutcome:
+        """Run a single task through the configured backend.
+
+        For ``hermes`` we forward the evaluator's full kwarg set
+        (max_turns / enabled_toolsets / verify / keep_sandbox /
+        extra_run_agent_args) so the tblite path stays bit-identical
+        to the pre-dispatch direct ``_run_one_task`` call. For
+        ``bench-cli`` those kwargs are ignored (the bench CLI owns
+        its own runtime knobs via the rendered scene YAML).
+        """
+        logger.info(
+            "evaluate: dispatching to %s for task %s",
+            type(backend).__name__,
+            task.get("task_id", "<unknown>"),
+        )
+        if backend_name == "hermes":
+            traj = backend.run_task(
+                task,
+                skills_dir=skills_folder_path,
+                model=chosen_model,
+                timeout_s=int(task.get("timeout_s", 0) or 0),
+                budget_usd=0.0,
+                anonymize_map=None,
+                max_turns=max_turns,
+                enabled_toolsets=enabled_toolsets,
+                extra_run_agent_args=extra_run_agent_args,
+                verify=verify,
+                keep_sandbox=keep_sandbox,
+            )
+        else:
+            traj = backend.run_task(
+                task,
+                skills_dir=skills_folder_path,
+                model=chosen_model,
+                timeout_s=int(task.get("timeout_s", 600) or 600),
+                budget_usd=0.0,
+                anonymize_map=None,
+            )
+        return traj.to_task_outcome()
+
     # Cascade: stage-1 first, short-circuit if all-zero.
     stage1 = [t for t in tasks if t.get("stage", 1) == 1]
     rest = [t for t in tasks if t.get("stage", 1) != 1]
@@ -722,18 +795,7 @@ def evaluate(
 
         raw: List[TaskOutcome]
         if max_workers <= 1:
-            raw = [
-                _run_one_task(
-                    t,
-                    skills_folder_path,
-                    model=chosen_model,
-                    max_turns=max_turns,
-                    enabled_toolsets=enabled_toolsets,
-                    extra_run_agent_args=extra_run_agent_args,
-                    verify=verify,
-                )
-                for t in expanded
-            ]
+            raw = [_dispatch(t) for t in expanded]
         else:
             raw = []
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -741,19 +803,7 @@ def evaluate(
                 # collapse duplicates when repeats > 1). Preserve the
                 # manifest-order → repeat-order correspondence so we can
                 # still sort by task_id below.
-                futures = [
-                    pool.submit(
-                        _run_one_task,
-                        t,
-                        skills_folder_path,
-                        model=chosen_model,
-                        max_turns=max_turns,
-                        enabled_toolsets=enabled_toolsets,
-                        extra_run_agent_args=extra_run_agent_args,
-                        verify=verify,
-                    )
-                    for t in expanded
-                ]
+                futures = [pool.submit(_dispatch, t) for t in expanded]
                 for fut in as_completed(futures):
                     raw.append(fut.result())
 
@@ -824,13 +874,9 @@ def evaluate(
     if cascade_truncated:
         mean_score = None
     else:
-        mean_score = (
-            sum(per_task_scores) / n if (n and scored_task_count) else None
-        )
+        mean_score = sum(per_task_scores) / n if (n and scored_task_count) else None
 
-    composite = compute_composite(
-        success_rate, avg_tool_calls, mean_score=mean_score
-    )
+    composite = compute_composite(success_rate, avg_tool_calls, mean_score=mean_score)
 
     failures = [
         {"task_id": o.task_id, "last_msg": o.last_msg or o.notes}
@@ -913,6 +959,13 @@ def _cli() -> int:
     ap.add_argument(
         "--json", action="store_true", help="dump full EvalResult as JSON to stdout"
     )
+    ap.add_argument(
+        "--keep-sandbox",
+        action="store_true",
+        help="preserve per-task HERMES_HOME dirs under ~/.cache/skill_evolve "
+        "after the run so trajectories + skill-dir state can be inspected. "
+        "Default cleans them up on sandbox exit.",
+    )
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -930,6 +983,7 @@ def _cli() -> int:
         force_synthetic=args.force_synthetic,
         verify=not args.no_verify,
         repeats=args.repeats,
+        keep_sandbox=args.keep_sandbox,
     )
 
     if args.json:
