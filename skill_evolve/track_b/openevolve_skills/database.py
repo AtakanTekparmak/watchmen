@@ -105,14 +105,14 @@ def cell_key(artifact: FolderArtifact) -> Tuple[int, ...]:
     """MAP-Elites cell key (tuple of bin indices)."""
     feats = compute_features(artifact)
     return tuple(
-        assign_bin(feats[dim], FEATURE_BIN_EDGES[dim])
-        for dim in FEATURE_DIMENSIONS
+        assign_bin(feats[dim], FEATURE_BIN_EDGES[dim]) for dim in FEATURE_DIMENSIONS
     )
 
 
 # ---------------------------------------------------------------------------
 # Program
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Program:
@@ -169,6 +169,7 @@ class Program:
 # Database
 # ---------------------------------------------------------------------------
 
+
 class ProgramDatabase:
     """Island-partitioned MAP-Elites archive of :class:`Program` objects."""
 
@@ -214,7 +215,10 @@ class ProgramDatabase:
             won = True
             logger.info(
                 "island %d: new cell %s occupied by %s (fit=%.4f)",
-                island, key, program.id[:8], program.fitness(),
+                island,
+                key,
+                program.id[:8],
+                program.fitness(),
             )
         else:
             incumbent = self.programs.get(incumbent_id)
@@ -223,14 +227,18 @@ class ProgramDatabase:
                 won = True
                 logger.info(
                     "island %d: cell %s improved %.4f -> %.4f (%s)",
-                    island, key,
+                    island,
+                    key,
                     incumbent.fitness() if incumbent else float("-inf"),
-                    program.fitness(), program.id[:8],
+                    program.fitness(),
+                    program.id[:8],
                 )
 
         # Global best tracking.
-        if (self.best_program_id is None
-                or program.fitness() > self.programs[self.best_program_id].fitness()):
+        if (
+            self.best_program_id is None
+            or program.fitness() > self.programs[self.best_program_id].fitness()
+        ):
             self.best_program_id = program.id
 
         return won
@@ -245,8 +253,9 @@ class ProgramDatabase:
         pid = self._rng.choice(list(cell.values()))
         return self.programs[pid]
 
-    def sample_inspiration(self, island: int,
-                           exclude: Optional[str] = None) -> Optional[Program]:
+    def sample_inspiration(
+        self, island: int, exclude: Optional[str] = None
+    ) -> Optional[Program]:
         """Second sample for LLM-prompt 'inspiration' slot (may differ
         from the parent). Returns None if the island has only one cell.
         """
@@ -294,13 +303,19 @@ class ProgramDatabase:
             key = cell_key(migrant.artifact)
             dst_cell = self.islands[dst]
             incumbent_id = dst_cell.get(key)
-            if (incumbent_id is None
-                    or migrant.fitness() > self.programs[incumbent_id].fitness()):
+            if (
+                incumbent_id is None
+                or migrant.fitness() > self.programs[incumbent_id].fitness()
+            ):
                 dst_cell[key] = migrant.id
                 moves.append((src, dst, migrant.id))
                 logger.info(
                     "migration: %s  island %d -> %d  (cell=%s fit=%.4f)",
-                    migrant.id[:8], src, dst, key, migrant.fitness(),
+                    migrant.id[:8],
+                    src,
+                    dst,
+                    key,
+                    migrant.fitness(),
                 )
         self.last_migration_generation = min(self.island_generations)
         return moves
@@ -321,19 +336,24 @@ class ProgramDatabase:
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
         for island_idx, key, prog in self.iter_archive_cells():
-            cell_dir = root / f"island_{island_idx}" / f"cell_{'_'.join(str(b) for b in key)}"
+            cell_dir = (
+                root / f"island_{island_idx}" / f"cell_{'_'.join(str(b) for b in key)}"
+            )
             cell_dir.mkdir(parents=True, exist_ok=True)
             prog.artifact.write_to(cell_dir / "skills")
             (cell_dir / "meta.json").write_text(
-                json.dumps({
-                    "id": prog.id,
-                    "parent_id": prog.parent_id,
-                    "generation": prog.generation,
-                    "metrics": prog.metrics,
-                    "fitness": prog.fitness(),
-                    "cell": list(key),
-                    "island": island_idx,
-                }, indent=2),
+                json.dumps(
+                    {
+                        "id": prog.id,
+                        "parent_id": prog.parent_id,
+                        "generation": prog.generation,
+                        "metrics": prog.metrics,
+                        "fitness": prog.fitness(),
+                        "cell": list(key),
+                        "island": island_idx,
+                    },
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
 
@@ -342,9 +362,11 @@ class ProgramDatabase:
 # Small seeded-RNG wrapper (avoid leaking global random state)
 # ---------------------------------------------------------------------------
 
+
 class _SeededRandom:
     def __init__(self, seed: Optional[int]) -> None:
         import random as _r
+
         self._r = _r.Random(seed)
 
     def choice(self, xs):

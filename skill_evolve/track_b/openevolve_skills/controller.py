@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,10 +78,48 @@ def run_evolution(
     base_artifact = FolderArtifact.from_path(
         seed_path,
         include_exts={
-            ".md", ".sh", ".py", ".jq",
-            ".json", ".yaml", ".yml", ".txt", ".xml",
+            ".md",
+            ".sh",
+            ".py",
+            ".jq",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".txt",
+            ".xml",
         },
     )
+    # kai-skills patch (2026-04-27): if the evaluator was configured with
+    # --anonymize-tasks, scrub verbatim manifest task names from the seed
+    # *.md files BEFORE we evaluate-and-archive. Critical: even if the
+    # evaluator's prompt-facing artifacts are clean, the K2.6 outer LLM
+    # still sees the parent SKILL.md verbatim (via render_folder), and a
+    # seed with task names baked into its description would propagate
+    # those names into every child patch.
+    #
+    # kai-skills patch (Phase E, 2026-04-29): the anonymizer module is
+    # now dispatched on ``evaluator.task_source``: in-file (tblite) vs
+    # ``skill_evolve.benchmark.skillsbench_anonymize`` (skillsbench).
+    # The Controller installs the chosen module on the evaluator and
+    # builds the id_map ONCE here so the chokepoints below + downstream
+    # iteration.py call through ``evaluator.anonymizer.<fn>`` rather
+    # than re-importing.
+    if getattr(evaluator, "anonymize_tasks", False):
+        _install_anonymizer(evaluator)
+        tid_map = evaluator.task_id_map()
+        replaced, detail = evaluator.anonymizer.sanitize_artifact(
+            base_artifact, tid_map
+        )
+        if replaced:
+            logger.warning(
+                "anonymize_tasks: sanitized %d md file(s) in seed; "
+                "rewrote names in: %s",
+                replaced,
+                ", ".join(f"{p}({len(h)})" for p, h in detail),
+            )
+        else:
+            logger.info("anonymize_tasks: seed clean (no task names found)")
+    # kai-skills patch end
     base_artifact.validate()
     variants = seed_variants(base_artifact, num_islands=config.num_islands)
 
@@ -126,7 +165,14 @@ def run_evolution(
         )
 
     # --- iterate -----------------------------------------------------------
+    # kai-skills patch (2026-04-24): after each iteration, snapshot the
+    # global best-so-far to disk so a mid-run kill preserves the winning
+    # folder. Prior behaviour only wrote best/ at end-of-run, so killing
+    # during gen N lost the artifact bytes (history.jsonl kept only the
+    # mutation recipe). Checkpoint dir: out_dir/best_so_far/.
     t_start = time.monotonic()
+    best_so_far_fitness: float = float("-inf")
+    best_so_far_dir = out_dir / "best_so_far"
     for gen in range(1, config.num_generations + 1):
         island = (gen - 1) % config.num_islands
         try:
@@ -142,6 +188,42 @@ def run_evolution(
             logger.warning("iter %d: island %d empty (%s); skipping", gen, island, exc)
             continue
         _append_history(history_path, res)
+
+        # kai-skills patch: incremental best-so-far checkpoint.
+        try:
+            current_best = db.best()
+            if (
+                current_best is not None
+                and current_best.fitness() > best_so_far_fitness
+            ):
+                if best_so_far_dir.exists():
+                    shutil.rmtree(best_so_far_dir)
+                current_best.artifact.write_to(best_so_far_dir)
+                (out_dir / "best_so_far_meta.json").write_text(
+                    json.dumps(
+                        {
+                            "id": current_best.id,
+                            "generation": current_best.generation,
+                            "iteration_found": current_best.iteration_found,
+                            "metrics": current_best.metrics,
+                            "fitness": current_best.fitness(),
+                            "written_at_gen": gen,
+                        },
+                        indent=2,
+                        default=str,
+                    ),
+                    encoding="utf-8",
+                )
+                logger.info(
+                    "best_so_far: gen=%d fitness=%.4f id=%s -> %s",
+                    gen,
+                    current_best.fitness(),
+                    current_best.id[:8],
+                    best_so_far_dir,
+                )
+                best_so_far_fitness = current_best.fitness()
+        except Exception as exc:  # pragma: no cover — checkpoint must not crash run
+            logger.warning("best_so_far checkpoint failed at gen %d: %s", gen, exc)
 
         # Periodic migration.
         if db.should_migrate():
@@ -172,8 +254,12 @@ def run_evolution(
     if best is not None:
         best_dir = out_dir / "best"
         if best_dir.exists():
-            import shutil
-
+            # kai-skills patch (2026-04-25): removed redundant local
+            # `import shutil` here. Having it inside the function turned
+            # `shutil` into a local for the whole scope (Python rule),
+            # which broke the earlier best_so_far checkpoint at gen N>1
+            # with "cannot access local variable 'shutil'". The module-
+            # level import at top of the file is the only one needed.
             shutil.rmtree(best_dir)
         best.artifact.write_to(best_dir)
         # Surface the evaluator's side-channel artifacts (per-task detail,
@@ -246,6 +332,128 @@ def _decode_eval_artifacts(raw: Dict[str, str]) -> Dict[str, Any]:
                 pass
         decoded[k] = v
     return decoded
+
+
+# kai-skills patch (Phase E, 2026-04-29): anonymizer dispatch + R-12
+# anti-leakage scanner. Both run at Controller.__init__ scope, called
+# once per run from ``run_evolution``. The dispatched module is stored
+# on the evaluator and re-used in iteration.py / evaluator chokepoints
+# so per-call import dispatch is centralized here.
+
+
+def _install_anonymizer(evaluator: SkillFolderEvaluator) -> None:
+    """Build the id_map and install the matching anonymizer module on
+    the evaluator. Dispatch keys off ``evaluator.task_source``.
+
+    For tblite (default), reuses the existing in-file functions at
+    :mod:`skill_evolve.track_b.openevolve_skills.evaluator` — both are
+    callable through a tiny adapter object that exposes the same
+    ``sanitize_artifact`` / ``find_leaked_names`` / ``sanitize_text``
+    surface.
+
+    For skillsbench, imports
+    :mod:`skill_evolve.benchmark.skillsbench_anonymize`, hydrates the
+    optional ``--task-list`` JSON to scope the id_map domain to the
+    20-task subset (or whatever the user passed), and stores the
+    hydrated records on the evaluator so the anti-leak scanner can
+    later read each task's ``environment/`` paths and magic numbers.
+    """
+    if evaluator.task_source == "skillsbench":
+        from skill_evolve.benchmark.skillsbench_anonymize import (
+            build_skillsbench_id_map,
+            find_leaked_skillsbench_names,
+            sanitize_artifact_skillsbench,
+            sanitize_text_skillsbench,
+        )
+
+        records = _load_skillsbench_task_records(evaluator.task_list)
+        evaluator._task_records = records
+        id_map = build_skillsbench_id_map(records)
+        evaluator.set_task_id_map(id_map)
+
+        def _sanitize_artifact_adapter(art, mapping):
+            _, detail = sanitize_artifact_skillsbench(art, mapping)
+            return len(detail), detail
+
+        evaluator.anonymizer = _AnonymizerModule(
+            sanitize_text=sanitize_text_skillsbench,
+            sanitize_artifact=_sanitize_artifact_adapter,
+            find_leaked_names=find_leaked_skillsbench_names,
+        )
+    else:
+        # tblite path — reuse the in-file helpers untouched. The wrapped
+        # ``sanitize_artifact`` already returns ``(replaced, detail)``.
+        from .evaluator import (
+            find_leaked_names as _find,
+            sanitize_artifact as _sanitize_artifact,
+            sanitize_text as _sanitize_text,
+        )
+
+        evaluator.anonymizer = _AnonymizerModule(
+            sanitize_text=_sanitize_text,
+            sanitize_artifact=_sanitize_artifact,
+            find_leaked_names=_find,
+        )
+
+
+def _load_skillsbench_task_records(
+    task_list: Optional[Path],
+) -> List[Any]:
+    """Hydrate the SkillsBench task records used to build the id_map.
+
+    When ``task_list`` is provided, hydrates ONLY those tasks. When
+    None, reads the full vendor directory listing. Each record is a
+    :class:`skill_evolve.benchmark.load.Task` with ``task_id`` set to
+    ``skillsbench/<dir_name>``.
+    """
+    from skill_evolve.benchmark.skillsbench_loader import hydrate_one
+
+    vendor_dir = (
+        Path(__file__).resolve().parent.parent.parent
+        / "benchmark"
+        / "vendor"
+        / "skillsbench"
+        / "tasks"
+    )
+    if task_list is not None and Path(task_list).exists():
+        ids = json.loads(Path(task_list).read_text(encoding="utf-8"))
+        names = [(tid.split("/", 1)[-1] if "/" in tid else tid) for tid in ids]
+    else:
+        names = (
+            sorted(
+                p.name
+                for p in vendor_dir.iterdir()
+                if p.is_dir() and (p / "task.toml").exists()
+            )
+            if vendor_dir.is_dir()
+            else []
+        )
+    records: List[Any] = []
+    for name in names:
+        td = vendor_dir / name
+        if not (td / "task.toml").exists():
+            logger.warning("skillsbench task missing: %s", td)
+            continue
+        try:
+            records.append(hydrate_one(td))
+        except Exception as exc:  # pragma: no cover — best-effort hydration
+            logger.warning("skillsbench hydrate failed for %s: %s", name, exc)
+    return records
+
+
+@dataclass
+class _AnonymizerModule:
+    """Tiny duck-typed bundle holding the anonymizer entrypoints.
+
+    Stored on ``SkillFolderEvaluator.anonymizer`` so chokepoints can
+    call ``evaluator.anonymizer.sanitize_text(...)`` without re-doing
+    the per-source dispatch on every call. ``sanitize_artifact`` is
+    expected to return ``(replaced_count, detail)``.
+    """
+
+    sanitize_text: Any
+    sanitize_artifact: Any
+    find_leaked_names: Any
 
 
 def _append_history(path: Path, res: IterationResult) -> None:

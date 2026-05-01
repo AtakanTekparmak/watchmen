@@ -35,6 +35,7 @@ class LLMClient(Protocol):
 # Synthetic client — deterministic, no network, always valid patch.
 # ---------------------------------------------------------------------------
 
+
 class SyntheticLLM:
     """Produces a cheap but syntactically-valid patch on every call.
 
@@ -71,11 +72,7 @@ class SyntheticLLM:
                 f"version: 0.0.{self._counter}\n"
                 f"---\n\n# {name}\n\nSynthetic content.\n"
             )
-            return (
-                f"<<<ADD_FILE {name}/SKILL.md>>>\n"
-                f"{body}"
-                f"<<<END_FILE>>>\n"
-            )
+            return f"<<<ADD_FILE {name}/SKILL.md>>>\n{body}<<<END_FILE>>>\n"
 
         # Randomly pick an existing skill, append a generation footer.
         names = sorted(self._parent.skill_names())
@@ -88,16 +85,13 @@ class SyntheticLLM:
             f"{self._counter}.\n"
         )
         new_content = src.rstrip("\n") + footer
-        return (
-            f"<<<EDIT_FILE {src_path}>>>\n"
-            f"{new_content}\n"
-            f"<<<END_FILE>>>\n"
-        )
+        return f"<<<EDIT_FILE {src_path}>>>\n{new_content}\n<<<END_FILE>>>\n"
 
 
 # ---------------------------------------------------------------------------
 # OpenRouter client — used when an API key is present.
 # ---------------------------------------------------------------------------
+
 
 class OpenRouterLLM:
     """OpenAI-compatible client pointed at OpenRouter. Lazily imports the SDK.
@@ -107,16 +101,28 @@ class OpenRouterLLM:
     upstream provider.
     """
 
-    def __init__(self, *, model: str = "anthropic/claude-opus-4.6",
-                 max_tokens: int = 4000,
-                 api_key: Optional[str] = None) -> None:
+    # kai-skills patch (2026-04-25 — fix track-b K2.6 parse_error)
+    # Reasoning models (kimi-k2.6, deepseek-r-style) silently spend the
+    # full max_tokens budget on internal reasoning and return content="".
+    # Empirically kimi-k2.6 burns ~13K reasoning tokens on a track-b
+    # mutation prompt, so we budget 20K total. The reasoning_max_tokens
+    # cap is best-effort (Moonshot upstream ignores it); the real safety
+    # net is the larger overall ceiling.
+    def __init__(
+        self,
+        *,
+        model: str = "anthropic/claude-opus-4.6",
+        max_tokens: int = 20000,
+        reasoning_max_tokens: Optional[int] = 2000,
+        api_key: Optional[str] = None,
+    ) -> None:
         try:
             from openai import OpenAI  # type: ignore
         except ImportError as exc:  # pragma: no cover — optional dep
-            raise RuntimeError(
-                "openai SDK not installed; pip install openai") from exc
+            raise RuntimeError("openai SDK not installed; pip install openai") from exc
         self._model = model
         self._max_tokens = max_tokens
+        self._reasoning_max_tokens = reasoning_max_tokens
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
         if not self._api_key:  # pragma: no cover
             raise RuntimeError("OPENROUTER_API_KEY not set")
@@ -124,9 +130,17 @@ class OpenRouterLLM:
             base_url="https://openrouter.ai/api/v1",
             api_key=self._api_key,
         )
+        # kai-skills patch (2026-04-25 — fix track-b K2.6 parse_error)
+        # Optional raw-response sink: if OPENROUTER_RAW_LOG_DIR is set, we
+        # dump every (system, user, content, reasoning, finish_reason)
+        # tuple as a numbered .json there. Cheap to leave in; only writes
+        # when env var is set.
+        self._raw_log_dir = os.environ.get("OPENROUTER_RAW_LOG_DIR")
+        self._raw_log_counter = 0
 
     def generate(self, *, system: str, user: str) -> str:
-        resp = self._client.chat.completions.create(
+        # kai-skills patch (2026-04-25 — fix track-b K2.6 parse_error)
+        kwargs: dict = dict(
             model=self._model,
             max_tokens=self._max_tokens,
             messages=[
@@ -134,14 +148,81 @@ class OpenRouterLLM:
                 {"role": "user", "content": user},
             ],
         )
-        return resp.choices[0].message.content or ""
+        if self._reasoning_max_tokens is not None:
+            kwargs["extra_body"] = {
+                "reasoning": {"max_tokens": self._reasoning_max_tokens}
+            }
+        resp = self._client.chat.completions.create(**kwargs)
+        msg = resp.choices[0].message
+        content = msg.content or ""
+        finish_reason = resp.choices[0].finish_reason
+        reasoning = getattr(msg, "reasoning", None) or ""
+
+        # kai-skills patch (2026-04-25 — fix track-b K2.6 parse_error)
+        if self._raw_log_dir:
+            try:
+                import json as _json
+                from pathlib import Path as _Path
+
+                self._raw_log_counter += 1
+                d = _Path(self._raw_log_dir)
+                d.mkdir(parents=True, exist_ok=True)
+                (d / f"call_{self._raw_log_counter:04d}.json").write_text(
+                    _json.dumps(
+                        {
+                            "model": self._model,
+                            "finish_reason": finish_reason,
+                            "content_len": len(content),
+                            "reasoning_len": len(reasoning),
+                            "content": content,
+                            "reasoning": reasoning[:4000],
+                            "system_first_400": system[:400],
+                            "user_first_400": user[:400],
+                        },
+                        indent=2,
+                    )
+                )
+            except Exception:  # pragma: no cover — debug sink, never fatal
+                pass
+
+        # kai-skills patch (2026-04-25 — fix track-b K2.6 parse_error)
+        # Loud diagnostic when the model returned no content. This is the
+        # exact failure mode that tanked v1/v2 (kimi-k2.6 burned the full
+        # max_tokens budget on reasoning). Logging it here makes future
+        # regressions instantly visible in track_b.log.
+        if not content.strip():
+            logger.warning(
+                "LLM returned empty content (model=%s, finish_reason=%s, "
+                "reasoning_chars=%d). If this repeats, raise max_tokens or "
+                "lower reasoning.max_tokens.",
+                self._model,
+                finish_reason,
+                len(reasoning),
+            )
+        return content
 
 
-def build_default_client(*, force_synthetic: bool, model: str,
-                         seed: Optional[int] = None) -> LLMClient:
+def build_default_client(
+    *, force_synthetic: bool, model: str, seed: Optional[int] = None
+) -> LLMClient:
     """Factory — returns a synthetic client if no keys or forced, else
     an :class:`OpenRouterLLM` instance.
+
+    Bug 15: a missing ``OPENROUTER_API_KEY`` was silently downgraded to
+    SyntheticLLM (random mutations). Live runs would burn the inner
+    trial budget against a synthetic outer LLM and never converge.
+    Now logged at WARNING so the regression is visible in run logs even
+    when the upstream pre-flight check is skipped.
     """
-    if force_synthetic or not os.environ.get("OPENROUTER_API_KEY"):
+    if force_synthetic:
+        return SyntheticLLM(seed=seed)
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        logger.warning(
+            "OPENROUTER_API_KEY missing; falling back to SyntheticLLM "
+            "(random mutations). Outer LLM model=%r will NOT be called. "
+            "Pass --force-synthetic to silence this warning, or set "
+            "OPENROUTER_API_KEY for a live run.",
+            model,
+        )
         return SyntheticLLM(seed=seed)
     return OpenRouterLLM(model=model)

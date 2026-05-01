@@ -50,6 +50,7 @@ class PatchParseError(ValueError):
 
 # ---- operation dataclasses ---------------------------------------------------
 
+
 @dataclass
 class AddFile:
     path: str
@@ -101,8 +102,9 @@ def parse_patch(text: str) -> List[Operation]:
 
         # --- full-folder rewrite ---
         if line.strip() == _REWRITE_OPEN:
-            body, j = _collect_until(lines, i + 1, _REWRITE_CLOSE,
-                                     origin_line=i, origin_token=_REWRITE_OPEN)
+            body, j = _collect_until(
+                lines, i + 1, _REWRITE_CLOSE, origin_line=i, origin_token=_REWRITE_OPEN
+            )
             ops.append(RewriteFolder(blob="\n".join(body) + "\n"))
             i = j + 1
             continue
@@ -110,8 +112,9 @@ def parse_patch(text: str) -> List[Operation]:
         # --- single-line delete ---
         m = _DELETE_LINE.match(line.strip())
         if m:
-            path = _validate_path_or_raise(m.group(1).strip(),
-                                           ctx=f"DELETE_FILE at line {i}")
+            path = _validate_path_or_raise(
+                m.group(1).strip(), ctx=f"DELETE_FILE at line {i}"
+            )
             ops.append(DeleteFile(path=path))
             i += 1
             continue
@@ -122,16 +125,20 @@ def parse_patch(text: str) -> List[Operation]:
         if m_add or m_edit:
             path_raw = (m_add or m_edit).group(1).strip()
             path = _validate_path_or_raise(
-                path_raw,
-                ctx=f"{'ADD_FILE' if m_add else 'EDIT_FILE'} at line {i}")
-            body, j = _collect_until(lines, i + 1, _END_FILE,
-                                     origin_line=i, origin_token=line.strip())
+                path_raw, ctx=f"{'ADD_FILE' if m_add else 'EDIT_FILE'} at line {i}"
+            )
+            body, j = _collect_until(
+                lines, i + 1, _END_FILE, origin_line=i, origin_token=line.strip()
+            )
             content = "\n".join(body)
             # Tolerate absence / presence of trailing newline — normalize.
             if not content.endswith("\n"):
                 content += "\n"
-            op: Operation = (AddFile(path=path, content=content)
-                             if m_add else EditFile(path=path, content=content))
+            op: Operation = (
+                AddFile(path=path, content=content)
+                if m_add
+                else EditFile(path=path, content=content)
+            )
             ops.append(op)
             i = j + 1
             continue
@@ -142,8 +149,9 @@ def parse_patch(text: str) -> List[Operation]:
     return ops
 
 
-def _collect_until(lines: List[str], start: int, sentinel: str,
-                   *, origin_line: int, origin_token: str) -> Tuple[List[str], int]:
+def _collect_until(
+    lines: List[str], start: int, sentinel: str, *, origin_line: int, origin_token: str
+) -> Tuple[List[str], int]:
     """Collect ``lines[start:]`` until a line == ``sentinel``.
 
     Returns ``(body, index_of_sentinel)``. Raises if not found.
@@ -152,7 +160,8 @@ def _collect_until(lines: List[str], start: int, sentinel: str,
         if lines[k].strip() == sentinel:
             return lines[start:k], k
     raise PatchParseError(
-        f"no matching {sentinel!r} for {origin_token!r} opened at line {origin_line}")
+        f"no matching {sentinel!r} for {origin_token!r} opened at line {origin_line}"
+    )
 
 
 def _validate_path_or_raise(raw: str, *, ctx: str) -> str:
@@ -163,6 +172,7 @@ def _validate_path_or_raise(raw: str, *, ctx: str) -> str:
 
 
 # ---- application -------------------------------------------------------------
+
 
 def apply_patch(parent: FolderArtifact, ops: List[Operation]) -> FolderArtifact:
     """Apply an ordered operation list to a parent folder and return new folder.
@@ -185,24 +195,22 @@ def apply_patch(parent: FolderArtifact, ops: List[Operation]) -> FolderArtifact:
     if rewrites:
         if len(ops) != 1:
             raise PatchParseError(
-                "REWRITE_FOLDER must be the sole operation in a patch")
+                "REWRITE_FOLDER must be the sole operation in a patch"
+            )
         return FolderArtifact.deserialize(rewrites[0].blob)
 
     for op in ops:
         if isinstance(op, AddFile):
             if op.path in files:
-                raise PatchParseError(
-                    f"ADD_FILE {op.path!r}: path already exists")
+                raise PatchParseError(f"ADD_FILE {op.path!r}: path already exists")
             files[op.path] = op.content
         elif isinstance(op, EditFile):
             if op.path not in files:
-                raise PatchParseError(
-                    f"EDIT_FILE {op.path!r}: path does not exist")
+                raise PatchParseError(f"EDIT_FILE {op.path!r}: path does not exist")
             files[op.path] = op.content
         elif isinstance(op, DeleteFile):
             if op.path not in files:
-                raise PatchParseError(
-                    f"DELETE_FILE {op.path!r}: path does not exist")
+                raise PatchParseError(f"DELETE_FILE {op.path!r}: path does not exist")
             del files[op.path]
         else:  # pragma: no cover — type system ensures exhaustive
             raise PatchParseError(f"unknown op type: {type(op).__name__}")
@@ -227,5 +235,6 @@ def mutate(parent: FolderArtifact, llm_text: str) -> FolderArtifact:
     # is useless for the agent.
     if child.num_skills() == 0:
         raise PatchParseError(
-            "after applying patch: 0 skills (need ≥1 SKILL.md subfolder)")
+            "after applying patch: 0 skills (need ≥1 SKILL.md subfolder)"
+        )
     return child

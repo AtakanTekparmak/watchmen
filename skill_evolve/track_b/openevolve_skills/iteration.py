@@ -23,12 +23,11 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 from .database import Program, ProgramDatabase, new_program_id
 from .evaluator import SkillFolderEvaluator
-from .folder_artifact import FolderArtifact, FolderArtifactError
+from .folder_artifact import FolderArtifactError
 from .llm_client import LLMClient, SyntheticLLM
 from .patch_parser import PatchParseError, mutate
 from .prompt_sampler import PromptSampler
@@ -42,7 +41,9 @@ class IterationResult:
     island: int
     parent_id: str
     child_id: Optional[str]
-    op_type: str  # "patch" | "rewrite" | "parse_error" | "validate_error" | "eval_error"
+    op_type: (
+        str  # "patch" | "rewrite" | "parse_error" | "validate_error" | "eval_error"
+    )
     score_delta: float
     cell: Optional[tuple] = None
     notes: str = ""
@@ -77,9 +78,12 @@ def run_iteration(
     except Exception as exc:  # pragma: no cover — network-level failures
         logger.warning("LLM generate() failed: %s", exc)
         return IterationResult(
-            generation=generation, island=island,
-            parent_id=parent.id, child_id=None,
-            op_type="eval_error", score_delta=0.0,
+            generation=generation,
+            island=island,
+            parent_id=parent.id,
+            child_id=None,
+            op_type="eval_error",
+            score_delta=0.0,
             notes=f"llm_error: {exc}",
         )
 
@@ -89,22 +93,63 @@ def run_iteration(
     except (PatchParseError, FolderArtifactError) as exc:
         logger.warning("patch rejected: %s", exc)
         return IterationResult(
-            generation=generation, island=island,
-            parent_id=parent.id, child_id=None,
-            op_type="parse_error", score_delta=0.0,
+            generation=generation,
+            island=island,
+            parent_id=parent.id,
+            child_id=None,
+            op_type="parse_error",
+            score_delta=0.0,
             notes=str(exc),
         )
 
+    # kai-skills patch (2026-04-27): validate-on-write guard against
+    # task-name leakage. When the evaluator is in anonymize mode, the
+    # outer LLM should never see real task IDs — but a misbehaving model
+    # could still emit them by guessing. Reject any patch that
+    # reintroduces a redacted name into the *.md prose layer (the
+    # router-readable surface). Scripts/refs are not scanned because they
+    # legitimately reference task fixtures by name.
+    if getattr(evaluator, "anonymize_tasks", False):
+        # kai-skills patch (Phase E, 2026-04-29): dispatch through the
+        # anonymizer module the Controller installed (in-file for
+        # tblite, skillsbench_anonymize for skillsbench). Falls back to
+        # the in-file functions if Controller wiring was bypassed
+        # (synthetic LLM tests etc.).
+        if getattr(evaluator, "anonymizer", None) is not None:
+            _find_leaked_names = evaluator.anonymizer.find_leaked_names
+        else:
+            from .evaluator import find_leaked_names as _find_leaked_names
+        leaks = _find_leaked_names(child_artifact, evaluator.task_id_map())
+        if leaks:
+            file_, name = leaks[0]
+            msg = (
+                f"patch reintroduces redacted task name `{name}` in "
+                f"`{file_}`; rejected ({len(leaks)} total leak(s))"
+            )
+            logger.warning(msg)
+            return IterationResult(
+                generation=generation,
+                island=island,
+                parent_id=parent.id,
+                child_id=None,
+                op_type="parse_error",
+                score_delta=0.0,
+                notes=msg,
+            )
+    # kai-skills patch end
+
     # 5. Evaluate child.
     try:
-        eval_res = evaluator.evaluate_artifact(child_artifact,
-                                               program_id="")
+        eval_res = evaluator.evaluate_artifact(child_artifact, program_id="")
     except Exception as exc:  # pragma: no cover
         logger.exception("evaluator crashed: %s", exc)
         return IterationResult(
-            generation=generation, island=island,
-            parent_id=parent.id, child_id=None,
-            op_type="eval_error", score_delta=0.0,
+            generation=generation,
+            island=island,
+            parent_id=parent.id,
+            child_id=None,
+            op_type="eval_error",
+            score_delta=0.0,
             notes=f"eval_error: {exc}",
         )
 
@@ -124,18 +169,26 @@ def run_iteration(
 
     score_delta = child.fitness() - parent.fitness()
     from .database import cell_key as _cell_key
+
     cell = _cell_key(child.artifact)
 
     logger.info(
         "iter %d island %d: %.4f -> %.4f (Δ=%+.4f) cell=%s",
-        generation, island,
-        parent.fitness(), child.fitness(),
-        score_delta, cell,
+        generation,
+        island,
+        parent.fitness(),
+        child.fitness(),
+        score_delta,
+        cell,
     )
 
     return IterationResult(
-        generation=generation, island=island,
-        parent_id=parent.id, child_id=child.id,
-        op_type="patch", score_delta=score_delta,
-        cell=cell, metrics=child.metrics,
+        generation=generation,
+        island=island,
+        parent_id=parent.id,
+        child_id=child.id,
+        op_type="patch",
+        score_delta=score_delta,
+        cell=cell,
+        metrics=child.metrics,
     )

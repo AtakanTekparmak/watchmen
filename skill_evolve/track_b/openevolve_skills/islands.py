@@ -66,8 +66,11 @@ def _bias_asis(base: FolderArtifact) -> FolderArtifact:
 
 
 def _bias_drop_generic(base: FolderArtifact) -> FolderArtifact:
-    new = {p: c for p, c in base.files.items()
-           if p.split("/", 1)[0] not in _GENERIC_SKILLS_TO_DROP}
+    new = {
+        p: c
+        for p, c in base.files.items()
+        if p.split("/", 1)[0] not in _GENERIC_SKILLS_TO_DROP
+    }
     # If dropping would leave zero skills (shouldn't happen with our seed,
     # but defensively): fall back to the original.
     art = FolderArtifact(files=new)

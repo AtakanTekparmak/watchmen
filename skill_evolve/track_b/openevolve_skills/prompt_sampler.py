@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
-from .database import Program, cell_key, compute_features, FEATURE_DIMENSIONS
+from .database import Program, cell_key, compute_features
 from .folder_artifact import FolderArtifact, MAX_FILES, MAX_TOTAL_BYTES
 
 
@@ -159,24 +159,30 @@ class PromptSampler:
 
         # Feedback from the last eval.
         failures_render = _render_json_block(
-            parent.eval_artifacts.get("failures", "[]"), default="(none)")
+            parent.eval_artifacts.get("failures", "[]"), default="(none)"
+        )
         invocations_render = _render_json_block(
-            parent.eval_artifacts.get("invocation_counts", "{}"), default="(none)")
+            parent.eval_artifacts.get("invocation_counts", "{}"), default="(none)"
+        )
         unused_render = _render_json_block(
-            parent.eval_artifacts.get("unused_skills", "[]"), default="(none)")
+            parent.eval_artifacts.get("unused_skills", "[]"), default="(none)"
+        )
 
         # Inspiration — a lighter-weight render (names + descriptions only,
         # no full bodies, to keep token budget under control).
         inspiration_render = (
             render_folder(inspiration.artifact, include_body=False)
-            if inspiration is not None else "(no inspiration available)"
+            if inspiration is not None
+            else "(no inspiration available)"
         )
 
         user = USER_TEMPLATE.format(
             cell_key=str(list(key)),
             fitness=parent.fitness(),
             success_rate=float(parent.metrics.get("success_rate", 0.0)),
-            tool_calls_per_success=float(parent.metrics.get("tool_calls_per_success", 0.0)),
+            tool_calls_per_success=float(
+                parent.metrics.get("tool_calls_per_success", 0.0)
+            ),
             num_skills=int(feats["num_skills"]),
             total_tokens=feats["total_tokens"],
             total_tokens_int=int(feats["total_tokens"]),

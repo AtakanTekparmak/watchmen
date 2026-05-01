@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, Iterator, List
@@ -140,7 +139,8 @@ class FolderArtifact:
             nk = _check_path(k)
             if not isinstance(v, str):
                 raise FolderArtifactError(
-                    f"file contents must be str; got {type(v).__name__} for {k!r}")
+                    f"file contents must be str; got {type(v).__name__} for {k!r}"
+                )
             if nk in normalized:
                 raise FolderArtifactError(f"duplicate path after normalize: {nk!r}")
             normalized[nk] = v
@@ -154,11 +154,11 @@ class FolderArtifact:
             raise FolderArtifactError("artifact has 0 files")
         if len(self.files) > MAX_FILES:
             raise FolderArtifactError(
-                f"too many files: {len(self.files)} > {MAX_FILES}")
+                f"too many files: {len(self.files)} > {MAX_FILES}"
+            )
         total = sum(len(c.encode("utf-8")) for c in self.files.values())
         if total > MAX_TOTAL_BYTES:
-            raise FolderArtifactError(
-                f"total size {total} > {MAX_TOTAL_BYTES} bytes")
+            raise FolderArtifactError(f"total size {total} > {MAX_TOTAL_BYTES} bytes")
         # Re-check each path (defense in depth).
         for p in self.files:
             _check_path(p)
@@ -253,8 +253,9 @@ class FolderArtifact:
             if line.startswith("===== FILE: ") and line.endswith(" ====="):
                 if current_path is not None:
                     raise FolderArtifactError(
-                        f"nested FILE header inside {current_path!r}")
-                current_path = line[len("===== FILE: "): -len(" =====")]
+                        f"nested FILE header inside {current_path!r}"
+                    )
+                current_path = line[len("===== FILE: ") : -len(" =====")]
                 current_lines = []
             elif line == _END_FENCE:
                 if current_path is None:
@@ -268,7 +269,8 @@ class FolderArtifact:
                     # reject real content so we don't silently drop data.
                     if line.strip():
                         raise FolderArtifactError(
-                            f"content outside FILE block: {line!r}")
+                            f"content outside FILE block: {line!r}"
+                        )
                 else:
                     current_lines.append(line)
 
@@ -300,8 +302,9 @@ class FolderArtifact:
         return target
 
     @classmethod
-    def from_path(cls, source: Path, *,
-                  include_exts: Iterable[str] | None = None) -> "FolderArtifact":
+    def from_path(
+        cls, source: Path, *, include_exts: Iterable[str] | None = None
+    ) -> "FolderArtifact":
         """Read a directory into a :class:`FolderArtifact`.
 
         Only text files are loaded. Binary or unreadable files are
