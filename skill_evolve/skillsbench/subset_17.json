@@ -1,0 +1,19 @@
+[
+  "skillsbench/azure-bgp-oscillation-route-leak",
+  "skillsbench/3d-scan-calc",
+  "skillsbench/lab-unit-harmonization",
+  "skillsbench/find-topk-similiar-chemicals",
+  "skillsbench/citation-check",
+  "skillsbench/simpo-code-reproduction",
+  "skillsbench/crystallographic-wyckoff-position-analysis",
+  "skillsbench/data-to-d3",
+  "skillsbench/financial-modeling-qa",
+  "skillsbench/sec-financial-report",
+  "skillsbench/offer-letter-generator",
+  "skillsbench/pddl-tpp-planning",
+  "skillsbench/econ-detrending-correlation",
+  "skillsbench/energy-ac-optimal-power-flow",
+  "skillsbench/exceltable-in-ppt",
+  "skillsbench/organize-messy-files",
+  "skillsbench/flink-query"
+]

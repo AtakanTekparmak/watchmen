@@ -1,0 +1,14 @@
+# Mirrors the benchflow-native Job.from_yaml schema documented at
+# .venv/lib/python3.12/site-packages/benchflow/job.py::Job.from_yaml.
+# Substituted at runtime: <task_dir>, <model>. (No <skills_dir> — the
+# smoke driver uses this template for the no-skills arm; the with-skills
+# arm reuses baseline_with_skills.yaml.tmpl.)
+# Single-trial smoke variant — max_retries: 0, concurrency: 1.
+tasks_dir: <task_dir>
+jobs_dir: runs/smoke/jobs
+agent: claude-code
+model: <model>
+environment: docker
+concurrency: 1
+max_retries: 0
+sandbox_user: agent

@@ -1,0 +1,22 @@
+# Mirrors the benchflow-native Job.from_yaml schema documented at
+# .venv/lib/python3.12/site-packages/benchflow/job.py::Job.from_yaml.
+# Substituted at runtime: <task_dir>, <model>, <skills_dir>, <jobs_dir>.
+# Phase D baseline variant (with skills mounted) — n_attempts=5 trials.
+tasks_dir: <task_dir>
+# Bug 18: <jobs_dir> is substituted at runtime by render_scene_yaml().
+# _force_jobs_dir() also overrides whatever is here, but parameterizing
+# the placeholder makes the template intent explicit and removes the
+# brittle hardcoded ``runs/baseline/jobs`` literal.
+jobs_dir: <jobs_dir>
+agent: claude-code
+model: <model>
+environment: docker
+concurrency: 1
+# Audit 5 Bug 4: max_retries is bench's PER-TRIAL retry budget. Setting
+# it to 4 means up to 5 attempts per trial on transient errors, which
+# can quietly 5x evolution spend. 1 = at most 2 attempts (one retry),
+# the right trade-off when the outer evolutionary loop already retries
+# whole trials at the next generation.
+max_retries: 1
+sandbox_user: agent
+skills_dir: <skills_dir>

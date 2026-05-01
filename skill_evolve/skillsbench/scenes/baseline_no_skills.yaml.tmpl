@@ -1,0 +1,21 @@
+# Mirrors the benchflow-native Job.from_yaml schema documented at
+# .venv/lib/python3.12/site-packages/benchflow/job.py::Job.from_yaml.
+# Substituted at runtime: <task_dir>, <model>, <jobs_dir>. (No
+# <skills_dir> — this is the baseline-without-skills control arm; the
+# skills_dir field is omitted entirely so JobConfig.skills_dir stays None.)
+# Phase D baseline variant (no skills) — n_attempts=5 trials.
+tasks_dir: <task_dir>
+# Bug 18: <jobs_dir> is substituted at runtime by render_scene_yaml().
+# _force_jobs_dir() also overrides whatever is here, but parameterizing
+# the placeholder makes the template intent explicit and removes the
+# brittle hardcoded ``runs/baseline/jobs`` literal.
+jobs_dir: <jobs_dir>
+agent: claude-code
+model: <model>
+environment: docker
+concurrency: 1
+# Audit 5 Bug 4: see baseline_with_skills.yaml.tmpl. 1 retry per trial
+# (2 attempts max) instead of 4 (5 attempts) — caps transient-error
+# blast radius on spend.
+max_retries: 1
+sandbox_user: agent
