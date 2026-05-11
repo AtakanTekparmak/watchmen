@@ -66,7 +66,7 @@ _BENCH_SHIM_CODE = (
     "import sys; "
     "import skill_evolve.agents.register_claude_code as _cc; "
     "from benchflow.agents.registry import AGENTS as _A; "
-    "assert 'claude-code' in _A, 'SG-1 claude-code registration failed'; "
+    "assert 'claude-code' in _A or 'gemini' in _A, 'SG-1 agent registration failed'; "
     "import skill_evolve.agents._benchflow_patches as _p; "
     "assert _p.is_applied(), 'SG-2 deploy_skills patch failed to apply'; "
     "from benchflow.cli.main import app; "
@@ -78,6 +78,7 @@ def _bench_cli_argv(
     yaml_path: "Path | str",
     task_dir: str,
     model: str,
+    agent: str = "claude-code",
 ) -> List[str]:
     """Build the argv that runs bench through the SG-1/SG-2 shim.
 
@@ -103,7 +104,7 @@ def _bench_cli_argv(
         "-t",
         str(task_dir),
         "-a",
-        "claude-code",
+        agent,
         "-m",
         model,
     ]
@@ -114,6 +115,56 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 _log = logging.getLogger(__name__)
+logger = _log
+
+
+def _sweep_orphaned_compose_projects(
+    timeout_s: float = 30, min_age_s: int = 900
+) -> int:
+    """Force-remove orphaned bench-cli eval containers older than ``min_age_s``.
+
+    Filters by name prefix ``skillsbench_`` (matches benchflow's docker-compose
+    project naming for SkillsBench tasks: ``skillsbench_<task>__<hash>-main-N``).
+    Only kills containers older than ``min_age_s`` to avoid nuking active
+    workers. Returns count removed. Best-effort; logs but never raises.
+    """
+    import subprocess as _sp
+    try:
+        # Use {{.RunningFor}} only for human-readable; rely on CreatedAt for parse.
+        proc = _sp.run(
+            [
+                "docker", "ps", "--filter", "name=skillsbench_",
+                "--format", "{{.ID}} {{.CreatedAt}}",
+            ],
+            capture_output=True, text=True, timeout=timeout_s,
+        )
+        now = time.time()
+        stale: List[str] = []
+        for line in proc.stdout.strip().splitlines():
+            parts = line.split(" ", 1)
+            if len(parts) != 2:
+                continue
+            cid, created_at = parts[0], parts[1]
+            # docker CreatedAt format: "2026-05-04 19:29:25 +0000 UTC"
+            try:
+                # Strip timezone parts; parse first 19 chars as UTC.
+                ts = datetime.strptime(created_at[:19], "%Y-%m-%d %H:%M:%S")
+                age = now - ts.timestamp()
+            except Exception:
+                continue
+            if age >= min_age_s:
+                stale.append(cid)
+        if not stale:
+            return 0
+        _sp.run(["docker", "rm", "-f", *stale], capture_output=True, timeout=timeout_s)
+        logger.warning(
+            "orphan sweep: removed %d stale containers (older than %ds)",
+            len(stale), min_age_s,
+        )
+        return len(stale)
+    except Exception as exc:
+        logger.warning("orphan sweep failed: %s", exc)
+        return 0
 
 
 # 429 rate-limit detection. The error string we see on disk looks like:
@@ -184,7 +235,7 @@ def _load_scene_template(with_skills: bool) -> str:
             return (
                 "tasks_dir: <task_dir>\n"
                 "jobs_dir: <jobs_dir>\n"
-                "agent: claude-code\n"
+                "agent: <agent>\n"
                 "model: <model>\n"
                 "environment: docker\n"
                 "concurrency: 1\n"
@@ -195,7 +246,7 @@ def _load_scene_template(with_skills: bool) -> str:
         return (
             "tasks_dir: <task_dir>\n"
             "jobs_dir: <jobs_dir>\n"
-            "agent: claude-code\n"
+            "agent: <agent>\n"
             "model: <model>\n"
             "environment: docker\n"
             "concurrency: 1\n"
@@ -237,12 +288,14 @@ def _render_scene(
     model: str,
     skills_dir: Optional[str],
     jobs_dir: str,
+    agent: str = "claude-code",
 ) -> str:
     """Substitute placeholders and force ``jobs_dir`` to a known path."""
     out = template.replace("<task_dir>", task_dir).replace("<model>", model)
     if skills_dir is not None:
         out = out.replace("<skills_dir>", skills_dir)
     out = out.replace("<jobs_dir>", jobs_dir)
+    out = out.replace("<agent>", agent)
     out = _force_jobs_dir(out, jobs_dir)
     return out
 
@@ -273,6 +326,7 @@ def _materialize_scene_yaml(
     model: str,
     skills_dir: Optional[str],
     jobs_dir: Path,
+    agent: str = "claude-code",
 ) -> Path:
     """Write the per-task scene YAML to ``<workdir>/scenes/<task_id>.yaml``.
 
@@ -292,6 +346,7 @@ def _materialize_scene_yaml(
         model=model,
         skills_dir=skills_dir,
         jobs_dir=str(jobs_dir),
+        agent=agent,
     )
     # ``task_id`` may contain slashes (e.g. ``skillsbench/<id>``);
     # normalize to a flat filename.
@@ -427,6 +482,160 @@ def _read_pytest_tail(trial_dir: Path, max_chars: int = 500) -> str:
     return text[-max_chars:]
 
 
+# v9d patch (2026-05-07): mutator-prompt enrichment.
+#
+# E1 + E2 meta-probes confirmed that the bottleneck of v5–v8 evolution was
+# ``failures_render`` containing only ``success_votes=0/3`` strings — no task
+# content, no trace excerpt, no agent final message. Given the actual trace,
+# DeepSeek-v4-pro authors task-specific patches in 4/5 hand-built E2 calls. We
+# pull a small excerpt out of ``acp_trajectory.jsonl`` so it can flow through
+# ``last_msg`` → ``failures_blob`` → mutator prompt.
+#
+# Also fixes the long-standing instrumentation gap where ``skills_invoked`` was
+# hardcoded to ``[]`` in this backend, masking actual invocation rates from
+# every prior evolution run's prompts.
+
+_SCRIPT_INVOKE_RE = re.compile(
+    r"\bpython3?\b\s+(?:[^\s'\"]*?/)?([\w-]+)/scripts/([\w.-]+\.py)\b"
+)
+
+
+def _summarize_acp_trajectory(
+    trial_dir: Path,
+    *,
+    max_excerpt_chars: int = 1500,
+    max_final_chars: int = 1200,
+    last_n_commands: int = 6,
+) -> Dict[str, Any]:
+    """Parse ``trajectory/acp_trajectory.jsonl`` and return a small summary.
+
+    Schema (Gemini CLI ACP, observed in benchflow 0.3.x):
+      - ``type=tool_call`` ``kind=execute`` → ``title`` is the bash command.
+      - ``type=tool_call`` ``kind=think`` → planning block (skipped — verbose).
+      - ``type=tool_call`` ``kind=edit`` → ``title`` is the file path.
+      - ``type=agent_message`` → ``text`` is the final user-facing answer.
+      - ``type=agent_thought`` → chain-of-thought (skipped — usually >5KB).
+
+    Returns ``{excerpt, final_message, skills_invoked}``. All values are
+    safe defaults (empty string / list) when the file is missing or
+    malformed; never raises. ``skills_invoked`` is the list of skill
+    folder names whose ``scripts/<x>.py`` appears in any execute title.
+    """
+    paths = (
+        trial_dir / "trajectory" / "acp_trajectory.jsonl",
+        trial_dir / "agent" / "acp_trajectory.jsonl",
+    )
+    jsonl: Optional[Path] = next((p for p in paths if p.is_file()), None)
+    if jsonl is None:
+        return {"excerpt": "", "final_message": "", "skills_invoked": []}
+
+    execute_titles: List[str] = []
+    edit_titles: List[str] = []
+    final_message: str = ""
+    skills: List[str] = []
+
+    try:
+        text = jsonl.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {"excerpt": "", "final_message": "", "skills_invoked": []}
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ev_type = ev.get("type")
+        if ev_type == "tool_call":
+            kind = ev.get("kind")
+            title = (ev.get("title") or "").strip()
+            if not title:
+                continue
+            if kind == "execute":
+                execute_titles.append(title)
+                for m in _SCRIPT_INVOKE_RE.finditer(title):
+                    skills.append(m.group(1))
+            elif kind == "edit":
+                edit_titles.append(title)
+        elif ev_type == "agent_message":
+            txt = ev.get("text") or ""
+            if isinstance(txt, str) and txt.strip():
+                final_message = txt[:max_final_chars]
+
+    # Compose excerpt: last N execute titles, then any edit titles.
+    tail = execute_titles[-last_n_commands:]
+    parts: List[str] = []
+    for i, t in enumerate(tail, 1):
+        # Hard-cap each title so a single multi-line heredoc can't blow the budget.
+        parts.append(f"  {i}. {t[:300]}")
+    if edit_titles:
+        parts.append("")
+        parts.append(f"  edits: {', '.join(edit_titles[-4:])[:240]}")
+    excerpt = "\n".join(parts)
+    if len(excerpt) > max_excerpt_chars:
+        excerpt = excerpt[:max_excerpt_chars] + "\n  [hard-truncated]"
+
+    # Dedupe skills, preserve order.
+    seen: set = set()
+    skills_invoked: List[str] = []
+    for s in skills:
+        if s not in seen:
+            seen.add(s)
+            skills_invoked.append(s)
+
+    return {
+        "excerpt": excerpt,
+        "final_message": final_message,
+        "skills_invoked": skills_invoked,
+    }
+
+
+def _build_failure_last_msg(
+    *,
+    verifier_status: str,
+    error: Optional[str],
+    verifier_error: Optional[str],
+    summary: Dict[str, Any],
+    max_total: int = 3000,
+) -> str:
+    """Assemble the enriched ``last_msg`` for a failed bench-cli trial.
+
+    Layout (sections only emitted when non-empty):
+
+      [verifier] <status> | <short err>
+      [final agent message]
+      <up to max_final_chars>
+      [last 6 commands]
+      <execute titles>
+
+    Capped at ``max_total`` chars. Ordering reflects what's most useful
+    to the mutator: status first, then the agent's own self-report,
+    then the bash trace.
+    """
+    short_err = ""
+    if error:
+        short_err = str(error)[:240]
+    elif verifier_error:
+        short_err = str(verifier_error)[:240]
+    sections: List[str] = []
+    if short_err:
+        sections.append(f"[verifier] {verifier_status} | {short_err}")
+    else:
+        sections.append(f"[verifier] {verifier_status}")
+    if summary.get("final_message"):
+        sections.append("[final agent message]")
+        sections.append(summary["final_message"])
+    if summary.get("excerpt"):
+        sections.append("[last 6 commands]")
+        sections.append(summary["excerpt"])
+    blob = "\n".join(sections)
+    if len(blob) > max_total:
+        blob = blob[:max_total] + "\n[hard-truncated]"
+    return blob
+
+
 def _classify(
     reward: float,
     error: Optional[str],
@@ -493,13 +702,26 @@ def _result_to_trajectory(
     except (TypeError, ValueError):
         tool_calls = 0
 
-    # last_msg: prefer agent error, then verifier error, then ""
-    last_msg_src = ""
-    if error:
-        last_msg_src = str(error)
-    elif verifier_error:
-        last_msg_src = str(verifier_error)
-    last_msg = _apply_anonymize(last_msg_src[:500], anonymize_map)
+    # v9d patch (2026-05-07): for failed trials, enrich last_msg with the
+    # ACP trajectory excerpt + agent final message. For passed trials, keep
+    # the historical short shape (errors only) — the mutator only needs
+    # rich context for failures it should fix.
+    summary = _summarize_acp_trajectory(trial_dir)
+    if not success:
+        last_msg_raw = _build_failure_last_msg(
+            verifier_status=verifier_status,
+            error=error,
+            verifier_error=verifier_error,
+            summary=summary,
+        )
+    else:
+        last_msg_raw = ""
+        if error:
+            last_msg_raw = str(error)
+        elif verifier_error:
+            last_msg_raw = str(verifier_error)
+        last_msg_raw = last_msg_raw[:500]
+    last_msg = _apply_anonymize(last_msg_raw, anonymize_map)
 
     # verifier_detail: stringified verifier_error or pytest_output.txt tail
     if verifier_error:
@@ -536,7 +758,11 @@ def _result_to_trajectory(
         success=success,
         tool_calls=tool_calls,
         elapsed_s=elapsed_s,
-        skills_invoked=[],  # bench doesn't surface this directly
+        # v9d patch (2026-05-07): parsed from acp_trajectory.jsonl by
+        # _summarize_acp_trajectory. Was hardcoded ``[]`` since Phase E v5;
+        # that gap masked invocation rates from every prior mutator prompt
+        # via ``unused_skills`` and ``invocation_counts``.
+        skills_invoked=list(summary.get("skills_invoked") or []),
         last_msg=last_msg,
         raw_completed=not bool(result_json.get("partial_trajectory", False)),
         notes=notes,
@@ -562,6 +788,7 @@ class BenchCliBackend(AgentBackend):
         budget_usd: float,
         anonymize_map: Optional[Dict[str, str]],
         workdir: Optional[Path] = None,
+        agent: str = "claude-code",
     ) -> TrajectoryResult:
         """Dispatch a task with 429-aware retry-with-backoff.
 
@@ -589,6 +816,7 @@ class BenchCliBackend(AgentBackend):
                     budget_usd=budget_usd,
                     anonymize_map=anonymize_map,
                     workdir=workdir,
+                    agent=agent,
                 )
             except BenchRateLimitedError as exc:
                 last_error = exc.original_error
@@ -641,12 +869,20 @@ class BenchCliBackend(AgentBackend):
         budget_usd: float,
         anonymize_map: Optional[Dict[str, str]],
         workdir: Optional[Path] = None,
+        agent: str = "claude-code",
     ) -> TrajectoryResult:
         """Single attempt at running a task through the bench CLI.
 
         Raises :class:`BenchRateLimitedError` if the resulting
         ``result.json`` reports an Anthropic 429.
         """
+        # Pre-dispatch defensive sweep: if a previous attempt orphaned a
+        # docker-compose project (e.g. due to TimeoutExpired or other
+        # subprocess failure), clean it up before launching a new eval.
+        pre_swept = _sweep_orphaned_compose_projects()
+        if pre_swept > 0:
+            _log.warning("orphan sweep (pre-dispatch): removed %d container(s)", pre_swept)
+
         # ``Task`` may arrive as the dataclass or its dict form; normalize.
         task_id: str = getattr(task, "task_id", None) or (
             task.get("task_id") if isinstance(task, dict) else "unknown"
@@ -675,6 +911,7 @@ class BenchCliBackend(AgentBackend):
             model=model,
             skills_dir=str(skills_dir) if skills_dir is not None else None,
             jobs_dir=jobs_dir,
+            agent=agent,
         )
 
         if budget_usd is not None and budget_usd > 0:
@@ -689,27 +926,36 @@ class BenchCliBackend(AgentBackend):
                 float(budget_usd),
             )
 
-        argv = _bench_cli_argv(yaml_path, task_dir, model)
+        argv = _bench_cli_argv(yaml_path, task_dir, model, agent=agent)
 
         try:
-            proc = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-            )
-        except subprocess.TimeoutExpired:
-            return TrajectoryResult(
-                task_id=task_id,
-                success=False,
-                tool_calls=0,
-                elapsed_s=float(timeout_s),
-                last_msg="bench cli timeout",
-                notes="bench cli timeout",
-                verified=None,
-                verifier_status="timeout",
-                cost_usd=None,
-            )
+            try:
+                proc = subprocess.run(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_s,
+                )
+            except subprocess.TimeoutExpired:
+                return TrajectoryResult(
+                    task_id=task_id,
+                    success=False,
+                    tool_calls=0,
+                    elapsed_s=float(timeout_s),
+                    last_msg="bench cli timeout",
+                    notes="bench cli timeout",
+                    verified=None,
+                    verifier_status="timeout",
+                    cost_usd=None,
+                )
+        finally:
+            # Container-leak guard: every subprocess.run path (success,
+            # nonzero rc, TimeoutExpired, or any unexpected exception)
+            # must sweep orphaned docker-compose projects so retries
+            # don't accumulate zombie eval containers.
+            swept = _sweep_orphaned_compose_projects()
+            if swept > 0:
+                _log.warning("orphan sweep (post-dispatch): removed %d container(s)", swept)
 
         if proc.returncode != 0:
             stderr = proc.stderr or ""
