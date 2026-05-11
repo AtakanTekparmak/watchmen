@@ -186,6 +186,12 @@ class SkillFolderEvaluator:
         agent_backend: str = "hermes",
         task_list: Optional["Path"] = None,
         leak_policy: str = "zero",
+        # Phase E v7 patch (2026-05-05): inner agent harness selection
+        # for the bench-cli backend (``claude-code`` | ``gemini``).
+        # Plumbed through to ``evaluate()`` and onward to
+        # ``BenchCliBackend.run_task(agent=...)``. Ignored by the hermes
+        # backend.
+        agent: str = "claude-code",
     ) -> None:
         self.force_synthetic = force_synthetic
         self.verify = verify
@@ -201,6 +207,8 @@ class SkillFolderEvaluator:
         self.agent_backend = agent_backend
         self.task_list = task_list
         self.leak_policy = leak_policy
+        # Phase E v7 patch (2026-05-05)
+        self.agent = agent
         # The Controller fills these once it has the resolved task
         # records. ``anonymizer`` is the dispatched module (in-file for
         # tblite, ``skillsbench_anonymize`` for skillsbench) and
@@ -285,6 +293,7 @@ class SkillFolderEvaluator:
                 sources=sources_arg,
                 task_ids=task_ids_arg,
                 agent_backend=self.agent_backend,
+                agent=self.agent,
             )
         translated = self._translate(res, artifact, program_id=program_id)
         return self._apply_leak_policy(translated, artifact)
@@ -396,10 +405,16 @@ class SkillFolderEvaluator:
         # kai-skills patch end
 
         # Feedback to fold into the next prompt.
+        # v9d patch (2026-05-07): cap raised from 240 → 3000 chars per
+        # entry. With 5 hot tasks and repeats=3, even 5×3000=15KB stays
+        # well under DeepSeek-v4-pro's 128k context. The bench-cli backend
+        # now fills last_msg with verifier status + agent final message +
+        # last 6 execute titles for failures, instead of just the agent
+        # error string. See _build_failure_last_msg in agents/bench_cli.py.
         failures_for_prompt = [
             {
                 "task_id": _alias(f.get("task_id")),
-                "last_msg": _alias_text(f.get("last_msg") or ""),
+                "last_msg": _alias_text((f.get("last_msg") or "")[:3000]),
             }
             for f in res.failures
         ]

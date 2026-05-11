@@ -60,10 +60,19 @@ Features: num_skills={num_skills}  total_tokens≈{total_tokens:.0f}  avg_specif
 
 ## Recent evaluation feedback
 
-Failures (per task):
+Failures (per task). Each entry's `last_msg` carries the verifier
+status, the agent's final user-facing message, and the last few bash
+commands the agent ran. Read these closely — they are the strongest
+signal for what to change. If the agent's final message looks correct
+but the verifier said failed, the issue is usually a format mismatch
+(answer file path, JSON shape, exact string). If the agent gave up or
+went off-task, the issue is usually the SKILL.md/script not steering it:
 {failures_render}
 
-Per-skill invocation counts (last run):
+Per-skill invocation counts (last run). Zero invocations on a skill
+that the failure traces show was relevant means the agent isn't being
+triggered — usually a SKILL.md description or "## Mandatory first
+action" framing problem, not a script-content problem:
 {invocations_render}
 
 Skills that were present but NEVER invoked by the agent:
@@ -98,6 +107,44 @@ Paths are interpreted under the skills-folder root, so a script at
     # ... do the thing ...
     <<<END_FILE>>>
 
+    <<<ADD_FILE my_skill/scripts/extract_records.py>>>
+    #!/usr/bin/env python3
+    # Extract structured records from <task-specific input> and emit JSON.
+    # CLI: `python3 scripts/extract_records.py <input> [<output>]`;
+    # default output is stdout. Exits non-zero on parse failure.
+    import json
+    import sys
+    from pathlib import Path
+
+    def parse_records(path):
+        # Real task-specific parsing logic — not a generic find/grep wrapper.
+        # Use stdlib only (json, csv, re, urllib, pathlib, xml.etree, zipfile,
+        # html.parser, sqlite3) plus libraries already present in the task
+        # container (e.g. openpyxl, python-docx, python-pptx, pandas, requests).
+        records = []
+        # ... task-specific work ...
+        return records
+
+    def main():
+        if not (2 <= len(sys.argv) <= 3):
+            print("usage: extract_records.py <input> [<output>]", file=sys.stderr)
+            return 2
+        src = Path(sys.argv[1])
+        if not src.is_file():
+            print("input not found:", src, file=sys.stderr)
+            return 1
+        records = parse_records(src)
+        out = json.dumps(records, indent=2)
+        if len(sys.argv) == 3:
+            Path(sys.argv[2]).write_text(out)
+        else:
+            print(out)
+        return 0
+
+    if __name__ == "__main__":
+        sys.exit(main())
+    <<<END_FILE>>>
+
     <<<EDIT_FILE my_skill/scripts/analyze.sh>>>
     #!/usr/bin/env bash
     set -euo pipefail
@@ -118,6 +165,24 @@ Constraints:
   under any skill's `scripts/` subdir.
 * SKILL.md YAML frontmatter must parse (the validator rejects patches
   that produce broken frontmatter — quote descriptions containing `:`).
+
+Script discipline (applies to every ADD_FILE / EDIT_FILE under
+`scripts/`):
+* Each script does ONE task-specific thing well — not a framework, not
+  a generic find/grep wrapper. Bash for shell-pipeline glue; Python
+  for parsing / API calls / structured data manipulation.
+* Exit 0 on success, non-zero on failure. Print short diagnostics to
+  stderr so the agent can react.
+* Accept task-relevant CLI args (file paths, query strings) or default
+  sensibly. The agent invokes scripts via terminal tools.
+* No `pip install`, no `apt-get`. Use stdlib + libraries already
+  present in the task container (`openpyxl`, `python-docx`,
+  `python-pptx`, `pandas`, `requests`, `lxml` are common; check the
+  parent's existing scripts for what's available).
+* Keep scripts under ~150 lines. If logic is bigger, split into
+  smaller scripts or reconsider the skill shape.
+* For Python: write logic, not docstring prose. One leading short
+  docstring is fine; avoid multi-paragraph commentary.
 
 Focus on the single most promising change, not a rewrite. Prefer
 adding/editing a script when the failure is the agent re-implementing
