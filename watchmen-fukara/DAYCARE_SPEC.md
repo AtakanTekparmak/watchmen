@@ -1,17 +1,54 @@
-# watchmen-daycare — design spec (v2)
+# watchmen-daycare — design spec (v3)
 
-> Skill-text evolution system sitting next to watchmen. Derives evals from real agentic
-> conversations, hill-climbs skill bundles so a weak target model gets better at those evals
-> over time. The skill-text analog of synthetic-self-improve-rl, adapted with the kai-skills
-> evolution lessons.
+> **Student-teacher skill distillation.** Real agentic conversations from a strong model
+> (Claude Opus 4.7, captured in watchmen corpus) serve as the teacher signal. A weak target
+> model (qwen3-30b-a3b or similar) is the student. Skill text is the knowledge bridge that
+> closes the capability gap — the same role RL does in synth-self-improve-rl, but via
+> iterative text mutation instead of gradient steps.
 
 ---
 
-## Changes from v1
+## Changes from v2 (v3 additions)
 
-This v2 incorporates three audits (methodology fidelity to synth-self-improve-rl, kai-skills
+Three final audits revealed blockers. Every fix below is a hard requirement. New sections and
+changes are tagged `[v3]` in their headings.
+
+**Corpus reality (from Phase 1 dry-run on ctf)**
+- R1. "1,206 ctf sessions" was wrong by 16×: only 33 non-subagent sessions ≥10 messages.
+  97% of user-turn volume comes from 5 mega-sessions. All framing updated. (Phase 0, Daemon.)
+- R2. Semantic dedup gate added to Phase 1d: ≥60 evals is necessary but not sufficient.
+  Cap ≤5 evals per anonymized prompt cluster (embedding cosine distance threshold 0.92).
+  30 distinct clusters × 2 evals each is the real floor. (Phase 1d.)
+- R3. Hard discard triggers added to Phase 1b for live-infra patterns that pass the
+  script_gen classifier but are 100% unverifiable: `ssh root@`, `nvidia-smi`,
+  `tmux list-sessions`, `tail -f /`. (Phase 1b.)
+- R4. pi-agent transcript format (`claude-agent-acp` JSONL schema at `~/.pi/agent/sessions/`)
+  documented as a second parser backend needed in `corpus.py`. Phase 0 doctor flags
+  session count lost to unknown format. (Phase 1a, corpus.py.)
+- R5. AUP-refusal contamination: CTF-specific prompts refused by Anthropic's filters must
+  be discarded at Phase 1b (not classified as discard_other — logged separately as
+  `discard_safety_refusal` for tracking). Judge calls on these would also hit refusals.
+
+**Framing fix: student-teacher distillation (not deployment optimization)**
+- F1. The model mismatch (optimize qwen3-32b, reference from Opus 4.7) is NOT a flaw —
+  it IS the design. The corpus captures Opus 4.7 behavior; skill text bridges the weak
+  model to that behavior. This mirrors synth-self-improve-rl's student-teacher dynamic
+  at the text layer instead of the weight layer. Phase 4 adds a ceiling metric. (Phase 4,
+  Comparison table, Non-negotiables.)
+
+**Closed-loop judge defense**
+- J1. Phase 4 Baseline A is a hard promotion block: `best.holdout_score ≤ baseline_a +
+  2ε` → `daycare promote` is DISALLOWED (was "flag for review"). The empty-bundle floor
+  is the only reliable escape valve from judge gaming. (Phase 4a.)
+- J2. eval-build runs on all 3 projects (ctf, pi, wmca) before the first evolution run.
+  The project with the highest count of semantically distinct surviving evals (post-dedup)
+  is selected as the first evolution target. (Phase 0, CLI.)
+
+## Changes from v1 (v2 additions, preserved)
+
+This v2 incorporated three audits (methodology fidelity to synth-self-improve-rl, kai-skills
 evolution lessons, watchmen integration). Every fix below is a hard requirement, not a
-suggestion. Sections that changed are tagged `[v2]` in their headings.
+suggestion.
 
 **Methodology fidelity (synth-self-improve-rl) fixes**
 - M1. Genealogy explicitly documented as GEPA rolling-best (not iter_0-anchored model
@@ -119,17 +156,20 @@ maturity. Standalone package now; plan to contribute upstream to firstbatchxyz/w
 
 ---
 
-## Comparison table
+## Comparison table [v3]
 
 | synth-self-improve-rl | watchmen-daycare |
 |---|---|
-| Optimize: model weights via prime-rl | Optimize: skill bundle text via GEPA rolling-best |
-| Dataset: synthetic from teacher LLM | Eval: extracted from watchmen corpus (real conversations), anonymized |
+| Teacher: strong LLM generating synthetic data | Teacher: Claude Opus 4.7 behavior captured in watchmen corpus (real conversations) |
+| Student: weak model optimized via RL | Student: weak model (qwen3-32b) optimized via skill text mutation |
+| Knowledge bridge: synthetic dataset | Knowledge bridge: evolved SKILL.md + scripts |
 | Anchor: iter_0 checkpoint (model weights) | Anchor: frozen `eval_set.jsonl` + pinned weak_model version + fixed sampling config |
 | Train budget: 100 RL steps | Mutation budget: K × max_iters skill candidates |
-| Eval: hub env held-out test | Eval: held-out 50% of forge eval_set, 5 rollouts |
+| Eval: hub env held-out test | Eval: held-out 50% of derived eval_set, 5 rollouts per eval |
 | Substrate: prime-rl + verifiers | Substrate: OpenRouter (weak model + judge), version-pinned |
+| Ceiling: teacher's eval score | Ceiling: Opus 4.7 + empty skill score on held-out (Baseline C) |
 | Weak model signal: reward from env | Weak model signal: LLM judge score against rubric, ≥0.0 ≤1.0 |
+| Cross-model concern: none (one model) | Cross-model concern: intentional student≠teacher by design |
 | Genealogy | iter_0-anchored (each step starts from base weights) | GEPA rolling-best (parent = previous winner). Justification: text edits compose; fixed anchor lives at the eval/sampling level, not the bundle. |
 
 ---
@@ -202,7 +242,14 @@ daycare daemon {install,uninstall,run}
    or 100% NULL, run `watchmen ingest --full` automatically; if that still fails, fall back
    to JSONL scanning (parse skill XML blocks out of transcripts). Document outcome in
    `doctor.json`.
-4. **M6**: Ping all three OpenRouter models with a 5-token request. Capture exact version
+4. **J2 — First-run multi-project eval probe**: if no prior `daycare run` has completed
+   for any project, automatically run `daycare eval-build` on ALL enabled projects before
+   the first evolution run. Select the project with the highest post-dedup distinct cluster
+   count as the first evolution target. Record the survey results in
+   `~/.watchmen/daycare/eval_survey.json`. CLI override: `--project <name>` skips the
+   survey and runs against the named project directly.
+
+5. **M6**: Ping all three OpenRouter models with a 5-token request. Capture exact version
    string from the response headers (`x-or-model-version` or equivalent; otherwise hash of
    the response metadata). Write `run.json.model_pins = {weak, proposer, judge}`. On every
    subsequent OR call in this run, re-check the version string. **Mismatch → abort the run**
@@ -303,8 +350,18 @@ For each candidate triple, classify using the judge model:
 | `skill_invoke` | A skill was invoked and produced an outcome | `tool_calls.skill_name` is set for this session turn |
 | `procedural_qa` | Assistant explained a procedure, concept, or made a decision | text-heavy response, no code execution needed |
 
-Discard: pure confirmations ("keep monitoring", "yes", single-word), turns with no
-substantive assistant content, anything requiring live infra to verify. Log discards
+**Hard discard triggers [v3 — R3]** (applied BEFORE judge classification, logged as
+`discard_live_infra` or `discard_safety_refusal`):
+- Bash input containing `ssh root@`, `ssh ubuntu@`, `nvidia-smi`, `tmux list-sessions`,
+  `tail -f /`, `watch ` — unverifiable live-infra state snapshots that look like `script_gen`
+- Next user turn contains API refusal markers: "I cannot assist with", "AUP", "Terms of
+  Service" — these will also be refused by the judge on OR
+- `discard_safety_refusal`: CTF-specific prompts that triggered Anthropic safety filters in
+  the original session (detected by assistant_text matching `"I'm not able to assist with"`
+  or `"I cannot help with"` patterns)
+
+After hard discard: pure confirmations ("keep monitoring", "yes", single-word), turns with no
+substantive assistant content, anything requiring live infra to verify. Log all discards
 to `eval_extraction_log.md`.
 
 ### 1c. Verifier config (rubric generation)
@@ -326,10 +383,25 @@ Score every admitted eval once with `<WEAK_MODEL>` + empty skill on OpenRouter:
 - `score >= 0.9`: already solved. Discard.
 - Otherwise: keep.
 
-**M8 — Minimum survival: 60 evals** (→ 30 holdout after 50/50 split). If fewer survive,
-abort with "insufficient distillable surface."
+**M8 — Minimum survival: 60 evals** (→ 30 holdout after 50/50 split). But count alone is
+insufficient. Apply semantic dedup before the floor check:
 
-Log discard counts by reason to `eval_extraction_log.md`.
+**R2 — Semantic dedup gate (mandatory)**:
+1. Embed every surviving eval's `anonymized_prompt` using a lightweight embedding model
+   (e.g. OR's `text-embedding-3-small` or a local sentence-transformer).
+2. Cluster by cosine similarity threshold 0.92 (tight — only near-duplicates cluster).
+3. Cap each cluster at ≤5 evals (keep the 5 with highest `baseline_score` variance within
+   the cluster, to preserve the most informative range).
+4. After dedup: require ≥30 distinct clusters (not ≥60 total). This is the real floor.
+
+The pod-monitor pattern alone produces 300+ near-duplicates in a single ctf session;
+without dedup, the holdout slice scores the same eval 30 times and the fitness signal
+is meaningless variance.
+
+If fewer than 30 distinct clusters survive, abort with "insufficient distillable surface —
+corpus lacks semantic diversity, not volume."
+
+Log discard counts + cluster distribution to `eval_extraction_log.md`.
 
 ### 1e. Train / held-out split + anonymization [v2]
 
@@ -646,33 +718,58 @@ carried over. (Mirrors the `/compact` pattern — disk is the source of truth.)
 
 ---
 
-## Phase 4 — Baselines [v2]
+## Phase 4 — Baselines [v3]
 
 After budget expires (or watchdog fires per K9), on its own time. Does not count against
 `--budget`.
 
 **BEST_BUNDLE** = bundle with highest fitness across all iters ≥ 1. Write `best_iter.json`.
 
-### 4a. Baseline A — empty bundle (floor) [v2 — renamed]
+### 4a. Baseline A — empty bundle (floor, HARD PROMOTION GATE) [v3 — J1]
 
 `<WEAK_MODEL>` + empty SKILL.md + no scripts on held-out, 5 rollouts.
-- If `best.holdout_score ≤ baseline_a.holdout_score + epsilon`: evolved skill didn't beat
-  floor. Flag `phase4_errors: ["best <= floor"]`. Diagnosis: eval set too easy, or
-  evolution converged to a solution the empty model already knows.
+
+**J1 — Hard promotion block**: if `best.holdout_score ≤ baseline_a.holdout_score + 2ε`
+(note: 2ε not ε — absorbs within-run LLM variance), **`daycare promote` is DISALLOWED**.
+Write `run.json.promote_blocked = true` and `promote_reason = "best_does_not_beat_floor"`.
+
+The empty-bundle floor is the only reliable escape valve from the judge closed-loop.
+Every kai-skills Phase E run that skipped or softened this check produced a retracted
+lift. This is a hard gate, not advisory.
+
+If `best.holdout_score > baseline_a + 2ε`: proceed to 4b.
 
 ### 4b. Baseline B — naive few-shot [v2 — renamed]
 
 Construct SKILL.md mechanically: 5 (prompt, reference) pairs from train slice, verbatim
-(but **passed through `anonymize.strip()`** so we don't leak identifiers into a baseline
-SKILL.md), no procedural guidance — just examples. Score `<WEAK_MODEL>` + this skill on
-held-out, 5 rollouts.
+(passed through `anonymize.strip()`), no procedural guidance — just examples. Score
+`<WEAK_MODEL>` + this skill on held-out, 5 rollouts.
 - If `best.holdout_score ≤ baseline_b.holdout_score + epsilon`: GEPA didn't earn its
-  compute. Naive distillation is enough. Log; don't crash.
+  compute. Naive distillation is enough. Log; don't crash. Promotion still allowed (passed A).
+
+### 4c. Baseline C — teacher ceiling [v3 — F1, new]
+
+**Student-teacher framing**: the corpus reference answers come from `<TEACHER_MODEL>` (the
+dominant model in the project's `corpus.db`, e.g. `claude-opus-4-7` for ctf). Score
+`<TEACHER_MODEL>` + empty skill on the held-out slice, 5 rollouts.
+
+This establishes the **distillation ceiling**: how well does the teacher already perform on
+these evals without any skill? Write `baseline_c.json`.
+
+The key metric is: **`gap_closed = (best - baseline_a) / (baseline_c - baseline_a)`**.
+A gap_closed of 0.5 means the evolved skill enables the weak model to close 50% of the
+teacher's capability advantage. This is the primary reported metric for a daycare run.
+
+Note: baseline_c does NOT gate promotion — the teacher ceiling is a measurement, not a
+requirement. A gap_closed of 0.0 = no distillation. gap_closed of 1.0 = full distillation.
+gap_closed > 1.0 = the skill makes the weak model EXCEED teacher performance on these evals
+(rare; usually means the evals are too easy, see baseline_a gate).
 
 Verdicts:
-- Pass A + Pass B: **real lift** — adopt.
-- Pass A, fail B: **eval-overfit risk or low value-add** — review before adopting.
-- Fail A: **bug** — evolution broke something fundamental.
+- Pass A (best > floor + 2ε) + gap_closed ≥ 0.3: **real distillation lift** — adopt.
+- Pass A + gap_closed 0.1–0.3: **modest lift** — consider adopting, run more iters.
+- Pass A + gap_closed < 0.1: **marginal** — log; don't promote unless very cheap to run again.
+- Fail A: **bug or judge gaming** — hard blocked from promotion.
 
 ### 4c. Reproducibility run (optional, M4 + v2)
 
