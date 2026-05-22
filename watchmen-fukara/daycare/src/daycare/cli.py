@@ -80,6 +80,9 @@ def _read_projects_json(watchmen_home: Path) -> dict:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return {}
+    # watchmen stores projects.json as a list of {project_key, source_repo} objects
+    if isinstance(data, list):
+        return {entry["project_key"]: entry for entry in data if "project_key" in entry}
     return data if isinstance(data, dict) else {}
 
 
@@ -206,10 +209,30 @@ def doctor() -> None:
 @click.option("--weak-model", default="qwen/qwen3-32b", show_default=True)
 @click.option("--judge-model", default="deepseek/deepseek-chat-v3-0324", show_default=True)
 @click.option("--skill", "skill_slug", default=None, help="override auto-selection")
+@click.option("--max-candidates", default=None, type=int, help="sample N triples before LLM calls (testing)")
+@click.option("--max-workers", default=4, type=int, show_default=True, help="parallel LLM call workers")
 @click.option(
     "--dry-run",
     is_flag=True,
     help="skip calibration LLM calls; print pre-1d candidate count only",
+)
+@click.option(
+    "--synthetic",
+    is_flag=True,
+    help="use synthetic Q&A generation (synth_builder) instead of corpus extraction",
+)
+@click.option(
+    "--n-per-skill",
+    default=20,
+    type=int,
+    show_default=True,
+    help="(synthetic only) number of questions to generate per skill",
+)
+@click.option(
+    "--proposer",
+    default="deepseek/deepseek-chat-v3-0324",
+    show_default=True,
+    help="(synthetic only) proposer model for question generation",
 )
 def eval_build(
     project: str,
@@ -218,7 +241,12 @@ def eval_build(
     weak_model: str,
     judge_model: str,
     skill_slug: str | None,
+    max_candidates: int | None,
+    max_workers: int,
     dry_run: bool,
+    synthetic: bool,
+    n_per_skill: int,
+    proposer: str,
 ) -> None:
     """Phase 1 only — dump eval_set.jsonl + report."""
     from .corpus import parse_transcript, query_sessions
@@ -266,21 +294,43 @@ def eval_build(
 
     api_key = _get_api_key()
 
-    try:
-        train, holdout = run_eval_build(
-            db_path=db_path,
-            source_repo=source_repo,
-            projects_json=watchmen_home / "projects.json",
-            bundle_dir=bundle_dir,
-            weak_model=weak_model,
-            judge_model=judge_model,
-            api_key=api_key,
-            seed=seed,
-            days=days,
-            run_dir=run_dir,
-        )
-    except ValueError as exc:
-        raise click.ClickException(f"eval-build aborted: {exc}") from exc
+    if synthetic:
+        from .synth_builder import run_synth_eval_build
+
+        try:
+            train, holdout = run_synth_eval_build(
+                bundle_dir=bundle_dir,
+                watchmen_home=watchmen_home,
+                project=project,
+                weak_model=weak_model,
+                proposer_model=proposer,
+                judge_model=judge_model,
+                api_key=api_key,
+                seed=seed,
+                n_per_skill=n_per_skill,
+                run_dir=run_dir,
+                max_workers=max_workers,
+            )
+        except ValueError as exc:
+            raise click.ClickException(f"synth eval-build aborted: {exc}") from exc
+    else:
+        try:
+            train, holdout = run_eval_build(
+                db_path=db_path,
+                source_repo=source_repo,
+                projects_json=watchmen_home / "projects.json",
+                bundle_dir=bundle_dir,
+                weak_model=weak_model,
+                judge_model=judge_model,
+                api_key=api_key,
+                seed=seed,
+                days=days,
+                run_dir=run_dir,
+                max_candidates=max_candidates,
+                max_workers=max_workers,
+            )
+        except ValueError as exc:
+            raise click.ClickException(f"eval-build aborted: {exc}") from exc
 
     # Cluster distribution table.
     by_type: dict[str, int] = {}

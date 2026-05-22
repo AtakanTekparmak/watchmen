@@ -29,6 +29,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import httpx
@@ -257,7 +259,7 @@ _RUBRIC_SYSTEM = (
     "- Required: concrete observable properties of the CANDIDATE TEXT ALONE (no reference comparison).\n"
     '- Format: "Score 0.0–1.0. Award 1.0 if: [criterion]. Award 0.5 if: [partial]. Award 0.0 if: [failure]."\n'
     "- Max 150 words.\n"
-    'Output JSON: {"rubric": "<text>"}'
+    'Output JSON: {{"rubric": "<text>"}}'
 )
 
 
@@ -460,6 +462,8 @@ def pull_and_classify(
     api_key: str,
     seed: int,
     run_dir: Path,
+    max_candidates: int | None = None,
+    max_workers: int = 4,
 ) -> list[dict]:
     """Phases 1a–1d, returning a list of pre-anonymization eval dicts.
 
@@ -467,113 +471,143 @@ def pull_and_classify(
     baseline_completion_len_tokens, accepted, source_session, source_skill.
 
     Discards are logged to ``run_dir/eval_extraction_log.md``.
+
+    Args:
+        max_candidates: if set, randomly sample this many triples before
+            LLM calls (for testing/speed). None = use all.
+        max_workers: thread-pool size for parallel classify + rubric calls.
     """
     log_path = run_dir / "eval_extraction_log.md"
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_lock = threading.Lock()
+
+    def _log(kind: str, detail: str) -> None:
+        with log_lock:
+            _log_discard(log_path, kind, detail)
 
     sessions = query_sessions(db_path, source_repo, days=days)
     candidates: list[dict] = []
 
+    # ── Step 1: collect all (session_meta, turn_index, turn, next_user) ──────
+    raw_triples: list[tuple[dict, int, Turn, str | None]] = []
     for sess in sessions:
         transcript_path = sess.get("transcript_path") or ""
         if not transcript_path:
-            _log_discard(log_path, "no_transcript_path", str(sess.get("session_id", "")))
+            _log("no_transcript_path", str(sess.get("session_id", "")))
             continue
         path = Path(transcript_path)
         if not path.exists():
-            _log_discard(log_path, "transcript_gone", str(sess.get("session_id", "")))
+            _log("transcript_gone", str(sess.get("session_id", "")))
             continue
-
         turns = parse_transcript(path)
         if not turns:
-            _log_discard(log_path, "empty_transcript", str(sess.get("session_id", "")))
+            _log("empty_transcript", str(sess.get("session_id", "")))
             continue
-
-        # We need next_user_text for acceptance — pair turn[i] with the
-        # user_text we already have buffered as the "next" prompt at i+1.
         for i, turn in enumerate(turns):
             next_user = turns[i + 1].user_text if (i + 1) < len(turns) else None
+            raw_triples.append((sess, i, turn, next_user))
 
-            cls = classify_triple(turn, judge_model, api_key)
-            if cls.startswith("discard_"):
-                _log_discard(
-                    log_path,
-                    cls,
-                    f"session={sess.get('session_id', '')} turn={i}",
-                )
-                continue
+    # Optional cap: sample before expensive LLM calls (for testing).
+    if max_candidates and len(raw_triples) > max_candidates:
+        rng = random.Random(seed)
+        raw_triples = rng.sample(raw_triples, max_candidates)
 
-            accepted = detect_acceptance(turn, next_user, judge_model=judge_model, api_key=api_key)
-            if accepted is None:
-                _log_discard(
-                    log_path,
-                    "discard_no_acceptance_signal",
-                    f"session={sess.get('session_id', '')} turn={i}",
-                )
-                continue
+    # ── Step 2: parallel classification (I/O-bound OR calls) ─────────────────
+    def _classify_one(item: tuple[dict, int, Turn, str | None]) -> tuple[dict, int, Turn, str | None, str, bool | None]:
+        sess, i, turn, next_user = item
+        sid = str(sess.get("session_id", ""))
+        cls = classify_triple(turn, judge_model, api_key)
+        if cls.startswith("discard_"):
+            _log(cls, f"session={sid} turn={i}")
+            return sess, i, turn, next_user, cls, None
+        accepted = detect_acceptance(turn, next_user, judge_model=judge_model, api_key=api_key)
+        if accepted is None:
+            _log("discard_no_acceptance_signal", f"session={sid} turn={i}")
+            return sess, i, turn, next_user, "discard_no_acceptance_signal", None
+        return sess, i, turn, next_user, cls, accepted
 
-            prompt = turn.user_text or ""
-            reference = _summarize_assistant(turn)
-            if not prompt.strip() or not reference.strip():
-                _log_discard(
-                    log_path,
-                    "discard_empty_fields",
-                    f"session={sess.get('session_id', '')} turn={i}",
-                )
-                continue
+    classified: list[tuple[dict, int, Turn, str | None, str, bool | None]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_classify_one, item): item for item in raw_triples}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if not result[4].startswith("discard_"):
+                classified.append(result)
 
-            rubric = generate_rubric(cls, prompt, reference, weak_model, judge_model, api_key)
-            if not rubric:
-                _log_discard(
-                    log_path,
-                    "discard_rubric_empty",
-                    f"session={sess.get('session_id', '')} turn={i}",
-                )
-                continue
+    # ── Step 3: parallel rubric generation ───────────────────────────────────
+    def _rubric_one(item: tuple[dict, int, Turn, str | None, str, bool | None]):
+        sess, i, turn, next_user, cls, accepted = item
+        sid = str(sess.get("session_id", ""))
+        prompt = turn.user_text or ""
+        reference = _summarize_assistant(turn)
+        if not prompt.strip() or not reference.strip():
+            _log("discard_empty_fields", f"session={sid} turn={i}")
+            return None
+        rubric = generate_rubric(cls, prompt, reference, weak_model, judge_model, api_key)
+        if not rubric:
+            _log("discard_rubric_empty", f"session={sid} turn={i}")
+            return None
+        return sess, i, turn, cls, accepted, prompt, reference, rubric
 
-            # Calibration — failure-mode #1 mandates ≥3 rollouts.
-            baseline_score = calibrate_eval(
-                prompt=prompt,
-                rubric=rubric,
-                bundle_dir=bundle_dir,
-                weak_model=weak_model,
-                api_key=api_key,
-                judge_model=judge_model,
-                seed=seed + i,
-                n_rollouts=3,
-            )
+    with_rubrics = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_rubric_one, item) for item in classified]
+        for fut in as_completed(futures):
+            r = fut.result()
+            if r is not None:
+                with_rubrics.append(r)
 
-            # Knowledge-gap filter.
-            if baseline_score <= 0.0:
-                _log_discard(
-                    log_path,
-                    "discard_calibration_zero",
-                    f"session={sess.get('session_id', '')} turn={i}",
-                )
-                continue
-            if baseline_score >= 0.9:
-                _log_discard(
-                    log_path,
-                    "discard_calibration_solved",
-                    f"session={sess.get('session_id', '')} turn={i} score={baseline_score:.2f}",
-                )
-                continue
+    # ── Step 4: calibration (subprocess-heavy; fewer workers) ─────────────────
+    def _calibrate_one(item):
+        sess, i, turn, cls, accepted, prompt, reference, rubric = item
+        sid = str(sess.get("session_id", ""))
+        baseline_score = calibrate_eval(
+            prompt=prompt,
+            rubric=rubric,
+            bundle_dir=bundle_dir,
+            weak_model=weak_model,
+            api_key=api_key,
+            judge_model=judge_model,
+            seed=seed + i,
+            n_rollouts=3,
+        )
+        # Knowledge-gap filter.
+        if baseline_score <= 0.0:
+            _log("discard_calibration_zero", f"session={sid} turn={i}")
+            return None
+        if baseline_score >= 0.9:
+            _log("discard_calibration_solved", f"session={sid} turn={i} score={baseline_score:.2f}")
+            return None
+        return sess, i, turn, cls, accepted, prompt, reference, rubric, baseline_score
 
-            sid = str(sess.get("session_id", ""))
-            candidates.append(
-                {
-                    "id": _make_eval_id(prompt, sid),
-                    "type": cls,
-                    "prompt": prompt,
-                    "reference": reference,
-                    "rubric": rubric,
-                    "baseline_score": baseline_score,
-                    "baseline_completion_len_tokens": 0,  # filled at anonymize time
-                    "accepted": bool(accepted),
-                    "source_session": sid,
-                    "source_skill": turn.skill_name,
-                }
-            )
+    # Use fewer workers for calibration (each spawns 3 subprocesses).
+    cal_workers = max(1, max_workers // 2)
+    surviving = []
+    with ThreadPoolExecutor(max_workers=cal_workers) as pool:
+        futures = [pool.submit(_calibrate_one, item) for item in with_rubrics]
+        for fut in as_completed(futures):
+            r = fut.result()
+            if r is not None:
+                surviving.append(r)
+
+    # Rebuild candidates list from surviving items.
+    for item in surviving:
+        sess, i, turn, cls, accepted, prompt, reference, rubric, baseline_score = item
+        sid = str(sess.get("session_id", ""))
+        candidates.append(
+            {
+                "id": _make_eval_id(prompt, sid),
+                "type": cls,
+                "prompt": prompt,
+                "reference": reference,
+                "rubric": rubric,
+                "baseline_score": baseline_score,
+                "baseline_completion_len_tokens": 0,  # filled at anonymize time
+                "accepted": bool(accepted),
+                "source_session": sid,
+                "source_skill": turn.skill_name,
+            }
+        )
 
     return candidates
 
@@ -933,6 +967,8 @@ def run_eval_build(
     seed: int,
     days: int,
     run_dir: Path,
+    max_candidates: int | None = None,
+    max_workers: int = 4,
 ) -> tuple[list[dict], list[dict]]:
     """Compose Phases 1a–1f. Returns (train, holdout).
 
@@ -952,6 +988,8 @@ def run_eval_build(
         api_key=api_key,
         seed=seed,
         run_dir=run_dir,
+        max_candidates=max_candidates,
+        max_workers=max_workers,
     )
 
     ctx = build_context(projects_json, bundle_dir, source_repo)
