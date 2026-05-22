@@ -14,8 +14,12 @@ Three final audits revealed blockers. Every fix below is a hard requirement. New
 changes are tagged `[v3]` in their headings.
 
 **Corpus reality (from Phase 1 dry-run on ctf)**
-- R1. "1,206 ctf sessions" was wrong by 16×: only 33 non-subagent sessions ≥10 messages.
-  97% of user-turn volume comes from 5 mega-sessions. All framing updated. (Phase 0, Daemon.)
+- R1. "1,206 ctf sessions" was wrong by 16×: 1,143 of those are subagents. The real ctf
+  working set is **76 non-subagent sessions** (all at `project_dir = /Desktop/work/ctf`;
+  sd-zero/ and pedogogical-rl/ are subdirs but sessions run from the ctf root).
+  An intermediate audit added a spurious `message_count ≥ 10` gate dropping 43 sessions —
+  that gate is NOT in the spec. Phase 1a processes all sessions (short ones just yield
+  fewer triples). 97% of user-turn volume still comes from ~5 mega-sessions. (Phase 1a.)
 - R2. Semantic dedup gate added to Phase 1d: ≥60 evals is necessary but not sufficient.
   Cap ≤5 evals per anonymized prompt cluster (embedding cosine distance threshold 0.92).
   30 distinct clusters × 2 evals each is the real floor. (Phase 1d.)
