@@ -84,6 +84,10 @@ _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 # Strip markdown code fences (```json ... ``` or ``` ... ```)
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
+# Last-resort: extract score float directly — handles Haiku's unescaped " in
+# reasoning strings that produce malformed JSON (e.g. "errors.""}).
+_SCORE_RE = re.compile(r'"score"\s*:\s*([0-9]*\.?[0-9]+)')
+
 
 def _parse_judge_response(text: str) -> float | None:
     """Pull a float score out of the judge response, with fallback passes.
@@ -92,6 +96,8 @@ def _parse_judge_response(text: str) -> float | None:
       1. Strip markdown code fences; try json.loads on the inner content.
       2. Direct json.loads of the full body.
       3. Greedy-regex out the outermost {…} block and json.loads that.
+      4. Regex-extract just the score float (handles Haiku's malformed JSON
+         where unescaped double-quotes in reasoning corrupt the structure).
     Returns the clamped score, or None if all attempts fail.
     """
     candidates: list[str] = []
@@ -119,6 +125,15 @@ def _parse_judge_response(text: str) -> float | None:
         score = data.get("score")
         if isinstance(score, (int, float)):
             return max(0.0, min(1.0, float(score)))
+
+    # Pass 4: raw score-field regex — last resort for malformed JSON
+    m = _SCORE_RE.search(text)
+    if m:
+        try:
+            return max(0.0, min(1.0, float(m.group(1))))
+        except ValueError:
+            pass
+
     return None
 
 
