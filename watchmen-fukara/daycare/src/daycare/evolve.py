@@ -156,19 +156,22 @@ def _count_invocations(
     api_key: str,
     rollouts: int,
     seed: int,
+    max_workers: int = 4,
 ) -> tuple[Counter, int]:
     """Run the bundle once over the train slice, return (Counter of slugs, total_rollouts).
 
-    Lightweight pass — 1 rollout per train eval to keep cost bounded
-    (full scoring already happens in 3c). The slugs come from any
-    ``<skill>...</skill>`` blocks the model emits in its completion.
+    Parallelized with ThreadPoolExecutor to avoid the sequential bottleneck.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     skill_prompt = build_skill_system_prompt(bundle_dir)
     counts: Counter = Counter()
     total = 0
-    for idx, row in enumerate(eval_rows):
+
+    def _one(idx_row: tuple[int, dict]):
+        idx, row = idx_row
         prompt = row.get("anonymized_prompt") or row.get("prompt") or ""
-        rollout = run_rollout_subprocess(
+        return run_rollout_subprocess(
             prompt=prompt,
             skill_system_prompt=skill_prompt,
             model=model,
@@ -176,16 +179,21 @@ def _count_invocations(
             seed=seed + idx,
             temperature=0.7,
         )
-        total += 1
-        if rollout.error is not None or not rollout.completion:
-            continue
-        completion = rollout.completion
-        if not _SKILL_INVOCATION_RE.search(completion):
-            continue
-        # Pull out the slug if present; otherwise count as "<unknown>".
-        m = _SKILL_SLUG_IN_BLOCK_RE.search(completion)
-        slug = m.group(1) if m else "<unknown>"
-        counts[slug] += 1
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_one, (idx, row)): idx for idx, row in enumerate(eval_rows)}
+        for fut in as_completed(futures):
+            rollout = fut.result()
+            total += 1
+            if rollout.error is not None or not rollout.completion:
+                continue
+            completion = rollout.completion
+            if not _SKILL_INVOCATION_RE.search(completion):
+                continue
+            # Pull out the slug if present; otherwise count as "<unknown>".
+            m = _SKILL_SLUG_IN_BLOCK_RE.search(completion)
+            slug = m.group(1) if m else "<unknown>"
+            counts[slug] += 1
     return counts, total
 
 
@@ -337,6 +345,7 @@ def build_weakness_report(
     api_key: str,
     rollouts: int,
     baseline_len_quartiles: list[float],
+    max_workers: int = 4,
 ) -> Path:
     """Phase 3a — produce ``run_dir/iter_{n}/weakness_report.md``.
 
@@ -388,13 +397,12 @@ def build_weakness_report(
             n_holdout=len(train_evals),
         )
 
-    # 2. Per-eval scores (we need them to find the bottom quartile). We rerun
-    # one cheap rollout per train eval and use mean score from train_summary
-    # buckets when available; for bottom-quartile selection we score evals
-    # individually here for ranking.
+    # 2. Per-eval scores (parallelized) — 1 rollout per train eval for bottom-quartile ranking.
     per_eval_scores: list[tuple[float, dict]] = []
     skill_prompt = build_skill_system_prompt(best_bundle_dir)
-    for idx, row in enumerate(train_evals):
+
+    def _score_one_train(idx_row: tuple[int, dict]) -> tuple[float, dict]:
+        idx, row = idx_row
         prompt = row.get("anonymized_prompt") or row.get("prompt") or ""
         raw_prompt = row.get("prompt") or ""
         rubric = row.get("rubric") or ""
@@ -407,8 +415,7 @@ def build_weakness_report(
             temperature=0.7,
         )
         if rollout.error is not None or not rollout.completion:
-            per_eval_scores.append((0.0, row))
-            continue
+            return (0.0, row)
         s = score_single(
             prompt=raw_prompt,
             rubric=rubric,
@@ -416,7 +423,14 @@ def build_weakness_report(
             judge_model=judge_model,
             api_key=api_key,
         )
-        per_eval_scores.append((float(s) if s is not None else 0.0, row))
+        return (float(s) if s is not None else 0.0, row)
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futs = {pool.submit(_score_one_train, (i, r)): i for i, r in enumerate(train_evals)}
+        for fut in _as_completed(futs):
+            per_eval_scores.append(fut.result())
 
     # Bottom-quartile rows by score.
     per_eval_scores.sort(key=lambda kv: kv[0])
@@ -457,7 +471,7 @@ def build_weakness_report(
 
     # 5. Invocations / unused render — lightweight train pass.
     invocation_counts, total_train = _count_invocations(
-        train_evals, best_bundle_dir, model, api_key, rollouts=1, seed=20_000
+        train_evals, best_bundle_dir, model, api_key, rollouts=1, seed=20_000, max_workers=max_workers
     )
     bundled_slugs: set[str] = set()
     # The bundle dir IS one skill (per spec the bundle is the SKILL.md+scripts
@@ -532,6 +546,27 @@ def build_weakness_report(
 
 _PROPOSER_SYSTEM_PROMPT = """You are a skill-bundle mutator. Your job is to emit ONE mutation
 to the current best bundle, targeting the specified failure cluster.
+
+IMPORTANT WORKFLOW — follow exactly:
+1. Call read_weakness_report() — understand the failure clusters.
+2. Call read_parent_bundle_file("SKILL.md") — read the current skill.
+3. Write your mutation targeting the assigned failure cluster.
+4. If your mutation includes ANY script file changes, call lint_script(path, content)
+   on EACH modified script BEFORE calling finish_candidate. Fix any syntax errors.
+5. Call finish_candidate() with the validated patch.
+
+HARD LIMIT: By your 6th tool call, you MUST have already decided your mutation.
+Your 7th tool call MUST be finish_candidate() with a non-empty patch_text.
+If you have not emitted a patch by tool call 7, call finish_candidate() immediately
+with whatever SKILL.md edit you have — even a small targeted addition is better than empty_patch.
+
+You have at most 8 tool calls. An empty patch_text is REJECTED.
+PREFER mutating SKILL.md only (add missing details, fix wrong values, expand guidance).
+Only modify scripts if absolutely necessary — they are complex Python and syntax errors will discard your candidate.
+
+The mutation must target the specific failure cluster you were assigned.
+Add concrete details the model is missing: exact flag names, exact thresholds,
+exact field names, exact command patterns — things only this skill can supply.
 
 Constraints on emitted mutations (K8 — script discipline):
 - No `pip install` calls — only Python stdlib + libraries already declared in
@@ -917,7 +952,7 @@ def _run_one_proposer(
         # marker in the kickoff message for now (the proposer model's own
         # sampling temperature is fixed at the provider default — this is a
         # known limitation of watchmen.Agent's signature).
-        terminal_args, messages = agent.run(user_msg, max_iter=8)
+        terminal_args, messages = agent.run(user_msg, max_iter=16)
     except Exception as exc:  # noqa: BLE001 — proposer faults shouldn't crash run
         print(f"[evolve] proposer_c{slot}_error: {exc}", file=sys.stderr)
         terminal_args = {}
@@ -1042,7 +1077,7 @@ def propose_candidates(
 
         # validate_scripts is run inside parse_and_apply, but we want to log
         # the error list explicitly so re-run it (it's cheap).
-        script_errors = validate_scripts(candidate_bundle)
+        script_errors = validate_scripts(candidate_bundle, parent_bundle_dir=best_bundle_dir)
         if script_errors:
             _append_history(
                 run_dir,
@@ -1463,6 +1498,7 @@ def run_evolution(
                 api_key=api_key,
                 rollouts=rollouts,
                 baseline_len_quartiles=baseline_len_quartiles,
+                max_workers=max_workers,
             )
 
             # 3b + 3b.5 — propose K candidates.
@@ -1510,7 +1546,9 @@ def run_evolution(
             )
             parent_tokens = _skill_md_tokens(parent_bundle)
         except Exception as exc:  # noqa: BLE001 — never let one iter kill the run
+            import traceback
             print(f"[evolve] iter_{iter_n} crashed: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
             stall_counter += 1
 
         # Metrics row.

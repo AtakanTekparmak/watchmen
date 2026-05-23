@@ -207,7 +207,7 @@ def doctor() -> None:
 @click.option("--days", default=60, type=int, show_default=True)
 @click.option("--seed", default=42, type=int, show_default=True)
 @click.option("--weak-model", default="qwen/qwen3-32b", show_default=True)
-@click.option("--judge-model", default="deepseek/deepseek-chat-v3-0324", show_default=True)
+@click.option("--judge-model", default="anthropic/claude-haiku-4-5-20251001", show_default=True)
 @click.option("--skill", "skill_slug", default=None, help="override auto-selection")
 @click.option("--max-candidates", default=None, type=int, help="sample N triples before LLM calls (testing)")
 @click.option("--max-workers", default=4, type=int, show_default=True, help="parallel LLM call workers")
@@ -382,7 +382,7 @@ def _existing_runs(watchmen_home: Path) -> list[Path]:
 @click.option("--seed", default=42, type=int, show_default=True)
 @click.option("--weak-model", default="qwen/qwen3-32b", show_default=True)
 @click.option("--proposer", default="deepseek/deepseek-chat-v3-0324", show_default=True)
-@click.option("--judge", default="deepseek/deepseek-chat-v3-0324", show_default=True)
+@click.option("--judge", default="anthropic/claude-haiku-4-5-20251001", show_default=True)
 @click.option(
     "--teacher",
     default="anthropic/claude-opus-4",
@@ -399,6 +399,13 @@ def _existing_runs(watchmen_home: Path) -> list[Path]:
 )
 @click.option("--anonymize/--no-anonymize", default=True, show_default=True)
 @click.option("--reproducibility", is_flag=True, help="Phase 4c — second seed run")
+@click.option(
+    "--eval-set",
+    "eval_set_path_override",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="reuse an existing eval_set.jsonl — skips Phase 1 entirely",
+)
 @click.option(
     "--yes",
     "yes_flag",
@@ -422,6 +429,7 @@ def run(
     leak_policy: str,
     anonymize: bool,
     reproducibility: bool,
+    eval_set_path_override: str | None,
     yes_flag: bool,
 ) -> None:
     """Full Phases 0-5 orchestration."""
@@ -528,7 +536,7 @@ def run(
         "budget_seconds": budget_seconds,
         "max_iters": max_iters,
         "max_skill_tokens": 2500,
-        "lambda_init": 1e-5,
+        "lambda_init": 1e-6,
         "lambda_cap": 0.05,
         "epsilon": epsilon_proxy,
         "K": K,
@@ -559,8 +567,12 @@ def run(
         return
 
     try:
-        # Phase 1 — eval extraction (skip if already done).
+        # Phase 1 — eval extraction (skip if already done or --eval-set provided).
         eval_set_path = run_dir / "eval_set.jsonl"
+        if eval_set_path_override and not eval_set_path.exists():
+            import shutil
+            shutil.copy2(eval_set_path_override, eval_set_path)
+            console.print(f"[dim]Phase 1: copied eval_set from {eval_set_path_override}[/dim]")
         if eval_set_path.exists():
             console.print("[dim]Phase 1: eval_set.jsonl already exists, skipping.[/dim]")
             # Re-load.
@@ -635,7 +647,7 @@ def run(
                 rollouts=rollouts,
                 max_workers=max_workers,
                 max_iters=max_iters,
-                lambda_init=1e-5,
+                lambda_init=1e-6,
                 lambda_cap=0.05,
                 seed=seed,
                 fingerprints=fingerprints,

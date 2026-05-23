@@ -293,10 +293,18 @@ def shebang_insurance(file_path: Path) -> None:
 # ─── Script syntax validation ─────────────────────────────────────────────
 
 
-def validate_scripts(candidate_dir: Path) -> list[str]:
+def validate_scripts(
+    candidate_dir: Path,
+    parent_bundle_dir: Path | None = None,
+) -> list[str]:
     """Run ``python -m py_compile`` on every .py and ``bash -n`` on every
     .sh under ``candidate_dir``. Return error messages as strings — empty
     list = all pass.
+
+    If ``parent_bundle_dir`` is provided, scripts that are byte-identical
+    to the parent are skipped — we only validate files that the mutation
+    actually changed. This prevents pre-existing broken scripts in the
+    parent bundle from failing every candidate.
 
     Errors carry the relative path + stderr first 200 chars so the
     proposer (via ``history.jsonl``) can see why a candidate was rejected.
@@ -307,6 +315,17 @@ def validate_scripts(candidate_dir: Path) -> list[str]:
         if not fpath.is_file():
             continue
         rel = fpath.relative_to(candidate_dir)
+
+        # Skip if unchanged from parent — don't fail candidates for pre-existing breakage.
+        if parent_bundle_dir is not None:
+            parent_copy = parent_bundle_dir / rel
+            if parent_copy.exists():
+                try:
+                    if fpath.read_bytes() == parent_copy.read_bytes():
+                        continue
+                except OSError:
+                    pass
+
         suffix = fpath.suffix.lower()
         if suffix == ".py":
             try:
@@ -392,5 +411,5 @@ def parse_and_apply(
         if fpath.is_file() and fpath.suffix.lower() in (".py", ".sh"):
             shebang_insurance(fpath)
 
-    errors = validate_scripts(candidate_dir)
+    errors = validate_scripts(candidate_dir, parent_bundle_dir=parent_bundle_dir)
     return candidate_dir, errors
