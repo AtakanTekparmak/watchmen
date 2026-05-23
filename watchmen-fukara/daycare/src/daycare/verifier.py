@@ -77,23 +77,37 @@ _JUDGE_SYSTEM_PROMPT = (
     "Do NOT compare to any reference. Judge only what the candidate text says."
 )
 
-# A permissive JSON-object regex used as the recovery path when the
-# judge wraps its answer in prose. Matches the first {...} chunk.
-_JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
+# Greedy regex: first { to last } — handles Claude Haiku's markdown-fenced JSON
+# and reasoning strings that contain inner } characters.
+_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+# Strip markdown code fences (```json ... ``` or ``` ... ```)
+_CODE_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
 
 def _parse_judge_response(text: str) -> float | None:
-    """Pull a float score out of the judge response, with one recovery pass.
+    """Pull a float score out of the judge response, with fallback passes.
 
     Strategy:
-      1. Direct ``json.loads`` of the full body.
-      2. Regex out the first ``{...}`` block and json.loads that.
-    Returns the clamped score, or None if both attempts fail.
+      1. Strip markdown code fences; try json.loads on the inner content.
+      2. Direct json.loads of the full body.
+      3. Greedy-regex out the outermost {…} block and json.loads that.
+    Returns the clamped score, or None if all attempts fail.
     """
-    candidates: list[str] = [text]
-    m = _JSON_OBJECT_RE.search(text)
-    if m:
-        candidates.append(m.group(0))
+    candidates: list[str] = []
+
+    # Pass 1: strip markdown code fences (Claude Haiku wraps JSON in ```json...```)
+    fence_m = _CODE_FENCE_RE.search(text)
+    if fence_m:
+        candidates.append(fence_m.group(1))
+
+    # Pass 2: raw full text
+    candidates.append(text)
+
+    # Pass 3: greedy outer-brace extraction (first { to last })
+    brace_m = _JSON_OBJECT_RE.search(text)
+    if brace_m:
+        candidates.append(brace_m.group(0))
 
     for blob in candidates:
         try:

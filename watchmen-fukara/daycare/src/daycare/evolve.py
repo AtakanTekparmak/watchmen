@@ -63,7 +63,7 @@ if TYPE_CHECKING:  # pragma: no cover
 # ─── Constants ────────────────────────────────────────────────────────────
 
 
-MAX_SKILL_TOKENS = 2500
+MAX_SKILL_TOKENS = 3000
 TEMPERATURE_SCHEDULE = [0.3, 0.6, 0.9, 0.3, 0.6, 0.9]
 
 

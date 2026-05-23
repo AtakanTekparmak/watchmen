@@ -207,7 +207,7 @@ def doctor() -> None:
 @click.option("--days", default=60, type=int, show_default=True)
 @click.option("--seed", default=42, type=int, show_default=True)
 @click.option("--weak-model", default="qwen/qwen3-32b", show_default=True)
-@click.option("--judge-model", default="anthropic/claude-haiku-4-5-20251001", show_default=True)
+@click.option("--judge-model", default="anthropic/claude-haiku-4.5", show_default=True)
 @click.option("--skill", "skill_slug", default=None, help="override auto-selection")
 @click.option("--max-candidates", default=None, type=int, help="sample N triples before LLM calls (testing)")
 @click.option("--max-workers", default=4, type=int, show_default=True, help="parallel LLM call workers")
@@ -382,7 +382,7 @@ def _existing_runs(watchmen_home: Path) -> list[Path]:
 @click.option("--seed", default=42, type=int, show_default=True)
 @click.option("--weak-model", default="qwen/qwen3-32b", show_default=True)
 @click.option("--proposer", default="deepseek/deepseek-chat-v3-0324", show_default=True)
-@click.option("--judge", default="anthropic/claude-haiku-4-5-20251001", show_default=True)
+@click.option("--judge", default="anthropic/claude-haiku-4.5", show_default=True)
 @click.option(
     "--teacher",
     default="anthropic/claude-opus-4",
