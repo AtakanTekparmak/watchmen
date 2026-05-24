@@ -149,7 +149,7 @@ def doctor() -> None:
     api_key_present = bool(os.environ.get("OPENROUTER_API_KEY"))
     report["api_key_present"] = api_key_present
     models = [
-        "qwen/qwen3-32b",
+        "qwen/qwen3.6-27b",
         "deepseek/deepseek-v4-pro",
         "anthropic/claude-opus-4.7",
     ]
@@ -206,7 +206,7 @@ def doctor() -> None:
 @click.argument("project")
 @click.option("--days", default=60, type=int, show_default=True)
 @click.option("--seed", default=42, type=int, show_default=True)
-@click.option("--weak-model", default="qwen/qwen3-32b", show_default=True)
+@click.option("--weak-model", default="qwen/qwen3.6-27b", show_default=True)
 @click.option("--judge-model", default="anthropic/claude-haiku-4.5", show_default=True)
 @click.option("--skill", "skill_slug", default=None, help="override auto-selection")
 @click.option("--max-candidates", default=None, type=int, help="sample N triples before LLM calls (testing)")
@@ -380,7 +380,7 @@ def _existing_runs(watchmen_home: Path) -> list[Path]:
 @click.option("--K", "K", default=6, type=int, show_default=True)
 @click.option("--rollouts", default=5, type=int, show_default=True)
 @click.option("--seed", default=42, type=int, show_default=True)
-@click.option("--weak-model", default="qwen/qwen3-32b", show_default=True)
+@click.option("--weak-model", default="qwen/qwen3.6-27b", show_default=True)
 @click.option("--proposer", default="deepseek/deepseek-v4-pro", show_default=True)
 @click.option("--judge", default="anthropic/claude-haiku-4.5", show_default=True)
 @click.option(
