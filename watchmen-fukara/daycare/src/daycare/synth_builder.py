@@ -80,7 +80,7 @@ def _proposer_call(
         "Content-Type": "application/json",
     }
     try:
-        with httpx.Client(timeout=240.0) as client:
+        with httpx.Client(timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=5.0)) as client:
             r = client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 json=body,
