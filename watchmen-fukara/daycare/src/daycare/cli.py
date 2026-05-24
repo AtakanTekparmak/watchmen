@@ -150,7 +150,7 @@ def doctor() -> None:
     report["api_key_present"] = api_key_present
     models = [
         "qwen/qwen3-32b",
-        "deepseek/deepseek-chat-v3-0324",
+        "deepseek/deepseek-v4-pro",
         "anthropic/claude-opus-4.7",
     ]
     for m in models:
@@ -381,7 +381,7 @@ def _existing_runs(watchmen_home: Path) -> list[Path]:
 @click.option("--rollouts", default=5, type=int, show_default=True)
 @click.option("--seed", default=42, type=int, show_default=True)
 @click.option("--weak-model", default="qwen/qwen3-32b", show_default=True)
-@click.option("--proposer", default="anthropic/claude-opus-4.7", show_default=True)
+@click.option("--proposer", default="deepseek/deepseek-v4-pro", show_default=True)
 @click.option("--judge", default="anthropic/claude-haiku-4.5", show_default=True)
 @click.option(
     "--teacher",
