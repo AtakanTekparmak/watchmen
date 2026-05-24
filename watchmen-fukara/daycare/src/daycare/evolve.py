@@ -1461,7 +1461,7 @@ def run_evolution(
 
     Termination conditions (in priority order):
       - watchdog.should_stop() True at iter boundary → break (status=budget_exhausted)
-      - stall_counter ≥ 3 → break (status=stalled)
+      - stall_counter ≥ 5 → break (status=stalled)
       - iter_n > max_iters → break (status=max_iters_reached)
 
     Returns the path to the best bundle (via load_best_bundle).
@@ -1574,7 +1574,7 @@ def run_evolution(
             status="promoted" if stall_counter == 0 else "no_improvement",
         )
 
-        if stall_counter >= 3:
+        if stall_counter >= 5:
             status = "stalled"
             break
     else:
