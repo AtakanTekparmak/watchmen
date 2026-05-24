@@ -407,6 +407,14 @@ def _existing_runs(watchmen_home: Path) -> list[Path]:
     help="reuse an existing eval_set.jsonl — skips Phase 1 entirely",
 )
 @click.option(
+    "--synthetic",
+    "synthetic_evals",
+    is_flag=True,
+    default=False,
+    help="Phase 1: generate evals synthetically from SKILL.md (synth_builder) instead of corpus extraction",
+)
+@click.option("--n-questions", default=10, type=int, show_default=True, help="(--synthetic) questions per skill")
+@click.option(
     "--yes",
     "yes_flag",
     is_flag=True,
@@ -430,6 +438,8 @@ def run(
     anonymize: bool,
     reproducibility: bool,
     eval_set_path_override: str | None,
+    synthetic_evals: bool,
+    n_questions: int,
     yes_flag: bool,
 ) -> None:
     """Full Phases 0-5 orchestration."""
@@ -589,19 +599,36 @@ def run(
                         continue
                     (holdout if row.get("split") == "holdout" else train).append(row)
         else:
-            console.print("[bold]Phase 1[/bold] — eval extraction")
-            train, holdout = run_eval_build(
-                db_path=db_path,
-                source_repo=source_repo,
-                projects_json=watchmen_home / "projects.json",
-                bundle_dir=bundle_dir / "skills" / skill_slug,
-                weak_model=weak_model,
-                judge_model=judge,
-                api_key=api_key,
-                seed=seed,
-                days=60,
-                run_dir=run_dir,
-            )
+            if synthetic_evals:
+                console.print("[bold]Phase 1[/bold] — synthetic eval generation")
+                from .synth_builder import run_synth_eval_build
+                train, holdout = run_synth_eval_build(
+                    bundle_dir=bundle_dir,
+                    watchmen_home=watchmen_home,
+                    project=project,
+                    weak_model=weak_model,
+                    judge_model=judge,
+                    proposer_model=proposer,
+                    api_key=api_key,
+                    n_per_skill=n_questions,
+                    seed=seed,
+                    run_dir=run_dir,
+                    max_workers=max_workers,
+                )
+            else:
+                console.print("[bold]Phase 1[/bold] — eval extraction")
+                train, holdout = run_eval_build(
+                    db_path=db_path,
+                    source_repo=source_repo,
+                    projects_json=watchmen_home / "projects.json",
+                    bundle_dir=bundle_dir / "skills" / skill_slug,
+                    weak_model=weak_model,
+                    judge_model=judge,
+                    api_key=api_key,
+                    seed=seed,
+                    days=60,
+                    run_dir=run_dir,
+                )
 
         epsilon = max(0.01, 1.0 / max(1, len(holdout)))
         run_json["epsilon"] = epsilon
