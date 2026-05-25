@@ -37,6 +37,7 @@ import hashlib
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -330,7 +331,7 @@ def validate_scripts(
         if suffix == ".py":
             try:
                 proc = subprocess.run(
-                    ["python", "-m", "py_compile", str(fpath)],
+                    [sys.executable, "-m", "py_compile", str(fpath)],
                     capture_output=True,
                     text=True,
                     timeout=15,
