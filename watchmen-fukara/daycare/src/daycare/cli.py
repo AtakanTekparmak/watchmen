@@ -614,6 +614,7 @@ def run(
                     seed=seed,
                     run_dir=run_dir,
                     max_workers=max_workers,
+                    skill_filter=skill_slug,
                 )
             else:
                 console.print("[bold]Phase 1[/bold] — eval extraction")

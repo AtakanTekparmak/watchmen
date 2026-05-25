@@ -334,11 +334,15 @@ def run_synth_eval_build(
     n_per_skill: int = 20,
     run_dir: Path | None = None,
     max_workers: int = 4,
+    skill_filter: str | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Generate + calibrate + split synthetic evals across every skill in a bundle.
 
     bundle_dir is the project bundle root (e.g. ``~/.watchmen/bundles/ctf``);
     we iterate over ``bundle_dir/skills/<slug>/`` for each skill.
+
+    If ``skill_filter`` is set, only generate evals for that skill slug.
+    This prevents eval dilution when evolving a single skill.
     """
     if run_dir is None:
         run_dir = bundle_dir / "_synth_run"
@@ -369,6 +373,8 @@ def run_synth_eval_build(
         if not (skill_dir / "SKILL.md").exists():
             continue
         slug = skill_dir.name
+        if skill_filter is not None and slug != skill_filter:
+            continue
 
         questions = generate_questions_for_skill(
             skill_dir=skill_dir,
