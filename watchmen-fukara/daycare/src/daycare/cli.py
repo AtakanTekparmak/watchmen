@@ -394,7 +394,7 @@ def _existing_runs(watchmen_home: Path) -> list[Path]:
 @click.option(
     "--leak-policy",
     type=click.Choice(["zero", "warn"]),
-    default="zero",
+    default="warn",
     show_default=True,
 )
 @click.option("--anonymize/--no-anonymize", default=True, show_default=True)
