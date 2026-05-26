@@ -107,7 +107,9 @@ def _judge_call(
             )
             r.raise_for_status()
             data = r.json()
-        return data["choices"][0]["message"]["content"] or ""
+        msg = data["choices"][0]["message"]
+        # DeepSeek thinking mode puts output in 'reasoning' and leaves content=None.
+        return msg.get("content") or msg.get("reasoning") or ""
     except Exception as exc:  # noqa: BLE001
         print(f"[eval_builder] judge_call_error: {exc}", file=sys.stderr)
         return None

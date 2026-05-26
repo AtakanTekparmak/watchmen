@@ -184,7 +184,9 @@ def score_single(
         return None
 
     try:
-        text = data["choices"][0]["message"]["content"] or ""
+        msg = data["choices"][0]["message"]
+        # DeepSeek thinking mode: content=None, output in 'reasoning'.
+        text = msg.get("content") or msg.get("reasoning") or ""
     except (KeyError, IndexError, TypeError) as exc:
         print(f"[verifier] judge_shape_error: {exc}", file=sys.stderr)
         return None

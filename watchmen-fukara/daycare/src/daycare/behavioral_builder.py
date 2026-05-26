@@ -255,7 +255,7 @@ def generate_behavioral_rubric(
         },
         ensure_ascii=False,
     )
-    raw = _judge_call(system, user, judge_model, api_key, max_tokens=400)
+    raw = _judge_call(system, user, judge_model, api_key, expect_json=False, max_tokens=400)
     parsed = _extract_json_obj(raw or "")
     if parsed and isinstance(parsed.get("rubric"), str):
         return parsed["rubric"].strip()
