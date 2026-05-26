@@ -64,7 +64,55 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 MAX_SKILL_TOKENS = 3000
+MAX_BUNDLE_TOKENS = 60000  # 2× largest known seed (~30k); bounds script growth
 TEMPERATURE_SCHEDULE = [0.3, 0.6, 0.9, 0.3, 0.6, 0.9]
+
+# Maps eval type → which part of the bundle likely needs fixing.
+type_to_category: dict[str, str] = {
+    "script_gen": "wrong_command_syntax",
+    "procedural_qa": "missing_procedure_knowledge",
+    "skill_invoke": "missing_script_capability",
+    "behavioral_action": "incomplete_workflow",
+}
+
+
+def _bundle_tokens(bundle_dir: Path) -> int:
+    """Sum cl100k_base tokens across SKILL.md + scripts/**/*.{py,sh} +
+    references/**/*.md. Hidden files (dotfiles) and __pycache__ are excluded.
+    """
+    import tiktoken
+
+    enc = tiktoken.get_encoding("cl100k_base")
+    total = 0
+    patterns = [
+        bundle_dir / "SKILL.md",
+        *bundle_dir.glob("scripts/**/*.py"),
+        *bundle_dir.glob("scripts/**/*.sh"),
+        *bundle_dir.glob("references/**/*.md"),
+    ]
+    for p in patterns:
+        if not p.is_file():
+            continue
+        if p.name.startswith(".") or "__pycache__" in str(p):
+            continue
+        try:
+            total += len(enc.encode(p.read_text(encoding="utf-8", errors="ignore")))
+        except Exception:  # noqa: BLE001
+            pass
+    return total
+
+
+def list_scripts(parent_bundle: Path) -> str:
+    """Return the parent bundle's scripts/ directory layout with byte sizes."""
+    scripts_dir = parent_bundle / "scripts"
+    if not scripts_dir.exists():
+        return "(no scripts/ in parent bundle)"
+    lines = []
+    for f in sorted(scripts_dir.rglob("*")):
+        if f.is_file() and not f.name.startswith("."):
+            rel = f.relative_to(parent_bundle)
+            lines.append(f"{rel}  ({f.stat().st_size} bytes)")
+    return "\n".join(lines) if lines else "(scripts/ is empty)"
 
 
 # Cluster round-robin: c0,c3 → cluster_1; c1,c4 → cluster_2; c2,c5 → cluster_3.
@@ -223,12 +271,26 @@ def _cluster_failures(
             }
         )
 
+    # Attach hint category derived from eval type so judge can confirm/override.
+    for row in payload_rows:
+        row["category"] = type_to_category.get(
+            row.get("type", ""), "missing_procedure_knowledge"
+        )
+
     system = (
         "Cluster the failing evals into 3-6 named failure modes. "
+        "For each cluster, assign a CATEGORY indicating where the fix lives:\n"
+        "  - missing_procedure_knowledge: SKILL.md is silent on the required step\n"
+        "  - wrong_command_syntax: SKILL.md has the step but wrong flag/argument\n"
+        "  - missing_script_capability: a needed script is absent or incomplete\n"
+        "  - incomplete_workflow: multi-step workflow truncated mid-way\n\n"
         "For each cluster: name (snake_case), severity (count of evals), "
+        "category from the 4 values above, "
         'primary failure mode in {"truncation","reasoning","format"}, '
         "and 2-3 paraphrased example prompts (≤120 chars each, ANONYMIZED).\n"
         'Output JSON: {"clusters": [{"name": "...", "severity": <int>, '
+        '"category": "missing_procedure_knowledge|wrong_command_syntax|'
+        'missing_script_capability|incomplete_workflow", '
         '"mode": "truncation|reasoning|format", "examples": ["...", ...]}, ...]}'
     )
     user_payload = json.dumps({"failing_evals": payload_rows}, ensure_ascii=False)
@@ -275,6 +337,13 @@ def _cluster_failures(
     if not isinstance(clusters, list) or not clusters:
         return _fallback_cluster_by_type(failing_rows)
 
+    _valid_categories = frozenset({
+        "missing_procedure_knowledge",
+        "wrong_command_syntax",
+        "missing_script_capability",
+        "incomplete_workflow",
+    })
+
     # Defensive normalisation.
     out: list[dict] = []
     for c in clusters[:6]:
@@ -285,8 +354,11 @@ def _cluster_failures(
         mode = str(c.get("mode") or "reasoning")
         if mode not in ("truncation", "reasoning", "format"):
             mode = "reasoning"
+        category = str(c.get("category") or "missing_procedure_knowledge")
+        if category not in _valid_categories:
+            category = "missing_procedure_knowledge"
         examples = [str(x)[:120] for x in (c.get("examples") or [])][:3]
-        out.append({"name": name, "severity": severity, "mode": mode, "examples": examples})
+        out.append({"name": name, "severity": severity, "category": category, "mode": mode, "examples": examples})
     return out or _fallback_cluster_by_type(failing_rows)
 
 
@@ -302,6 +374,7 @@ def _fallback_cluster_by_type(rows: list[dict]) -> list[dict]:
             {
                 "name": f"{t}_failures",
                 "severity": len(items),
+                "category": type_to_category.get(t, "missing_procedure_knowledge"),
                 "mode": "reasoning",
                 "examples": [(r.get("anonymized_prompt") or r.get("prompt") or "")[:120] for r in items[:3]],
             }
@@ -500,7 +573,7 @@ def build_weakness_report(
         lines.append("_No failure clusters extracted._")
     else:
         for c in clusters:
-            lines.append(f"### {c['name']}  · severity={c['severity']}  · mode={c['mode']}")
+            lines.append(f"### {c['name']}  · severity={c['severity']}  · category={c.get('category', 'missing_procedure_knowledge')}  · mode={c['mode']}")
             for ex in c.get("examples", []):
                 lines.append(f"- `{ex}`")
             lines.append("")
@@ -544,42 +617,42 @@ def build_weakness_report(
 # ─── Phase 3b — propose_candidates ────────────────────────────────────────
 
 
-_PROPOSER_SYSTEM_PROMPT = """You are a skill-bundle mutator. Your job is to emit ONE mutation
-to the current best bundle, targeting the specified failure cluster.
+_PROPOSER_SYSTEM_PROMPT_TEMPLATE = """You are a skill-bundle mutator. Emit ONE mutation
+to the current best bundle, targeting the assigned failure cluster.
 
-IMPORTANT WORKFLOW — follow exactly:
-1. Call read_weakness_report() — understand the failure clusters.
-2. Call read_parent_bundle_file("SKILL.md") — read the current skill.
-3. Write your mutation targeting the assigned failure cluster.
-4. If your mutation includes ANY script file changes, call lint_script(path, content)
-   on EACH modified script BEFORE calling finish_candidate. Fix any syntax errors.
-5. Call finish_candidate() with the validated patch.
+The bundle is the FULL skill package — SKILL.md + scripts/ + references/.
+Mutate whichever file(s) best fix the failure. SKILL.md changes alter what the
+weak model knows; script changes alter what the weak model can do.
 
-HARD LIMIT: By your 6th tool call, you MUST have already decided your mutation.
-Your 7th tool call MUST be finish_candidate() with a non-empty patch_text.
-If you have not emitted a patch by tool call 7, call finish_candidate() immediately
-with whatever SKILL.md edit you have — even a small targeted addition is better than empty_patch.
+Choose your target by reading the weakness report's cluster.category field:
+  - missing_procedure_knowledge → edit SKILL.md (add the missing step/value)
+  - wrong_command_syntax         → edit SKILL.md (correct flag/argument)
+  - missing_script_capability    → ADD_FILE or EDIT_FILE a script under scripts/
+  - incomplete_workflow          → may require both (SKILL.md + script)
 
-You have at most 8 tool calls. An empty patch_text is REJECTED.
-PREFER mutating SKILL.md only (add missing details, fix wrong values, expand guidance).
-Only modify scripts if absolutely necessary — they are complex Python and syntax errors will discard your candidate.
+WORKFLOW — follow exactly:
+1. Call read_weakness_report() — read the cluster.category for your target.
+2. Call list_parent_bundle_files() — see what's there.
+3. Call read_parent_bundle_file("SKILL.md") and any relevant scripts/ files.
+4. If you plan a script change, call list_scripts() to confirm naming/layout.
+5. Draft your mutation. Call validate_sentinel_patch() to dry-run.
+6. For EVERY script you add or modify, call lint_script(path, content) BEFORE
+   finish_candidate. Fix any syntax errors.
+7. For SKILL.md changes, call count_skill_tokens(content) — must be ≤ {max_skill}.
+8. Call finish_candidate(patch_text, target_cluster, reasoning).
 
-The mutation must target the specific failure cluster you were assigned.
-Add concrete details the model is missing: exact flag names, exact thresholds,
-exact field names, exact command patterns — things only this skill can supply.
+HARD LIMITS:
+- ≤ 16 tool calls total.
+- An empty patch_text is REJECTED.
+- SKILL.md ≤ {max_skill} cl100k_base tokens.
+- Whole bundle ≤ {max_bundle} cl100k_base tokens.
+- Each script ≤ 150 lines.
+- No `pip install` calls; stdlib + requirements.txt only.
+- All script CLIs via argparse. No hardcoded paths.
+- py_compile / `bash -n` must pass.
+- Generic guidance only — no session IDs, user names, project identifiers.
 
-Constraints on emitted mutations (K8 — script discipline):
-- No `pip install` calls — only Python stdlib + libraries already declared in
-  `requirements.txt` of the bundle.
-- Each script file ≤ 150 lines.
-- All CLI arguments via `argparse`. No hardcoded paths.
-- Every Python script: `python -m py_compile <file>` must pass.
-- Every bash script: `bash -n <file>` must pass.
-- SKILL.md must stay under MAX_SKILL_TOKENS = 2500 (tiktoken cl100k_base).
-- Do not include literal session IDs, user names, absolute home paths, or any
-  project identifier from the eval set. Generic guidance only.
-
-Sentinel-block mutation format (the ONLY accepted format):
+Sentinel-block format (the ONLY accepted format):
 
     <<<ADD_FILE path/relative/to/bundle>>>
     ... full file content ...
@@ -594,20 +667,29 @@ Sentinel-block mutation format (the ONLY accepted format):
     <<<REWRITE_FOLDER scripts>>>
     --- file: scripts/foo.py
     ... content ...
-    --- file: scripts/bar.sh
+    --- file: scripts/bar.py
     ... content ...
     <<<END_REWRITE>>>
 
-You may NOT read any held-out slice data. Use the available tools to read the
-weakness report, parent bundle, prior mutation log, and peer skills.
+CRITICAL: every ADD_FILE and EDIT_FILE block MUST end with <<<END_FILE>>> on
+its own line. A patch missing any <<<END_FILE>>> terminator is REJECTED outright
+— use validate_sentinel_patch() to verify before finishing.
 
-Use `validate_sentinel_patch` to dry-run your patch before emitting it.
-Use `lint_script` to validate any script body. Use `count_skill_tokens` to
-stay under 2500 on SKILL.md.
-
-When ready, call `finish_candidate(patch_text, target_cluster, reasoning)`.
+You may NOT read held-out slice data. Use only the proposer tools.
 Reasoning ≤ 200 words.
 """
+
+_PROPOSER_SYSTEM_PROMPT = _PROPOSER_SYSTEM_PROMPT_TEMPLATE.format(
+    max_skill=MAX_SKILL_TOKENS,
+    max_bundle=MAX_BUNDLE_TOKENS,
+)
+
+assert f"{MAX_SKILL_TOKENS}" in _PROPOSER_SYSTEM_PROMPT, (
+    "MAX_SKILL_TOKENS must appear verbatim in the proposer prompt"
+)
+assert f"{MAX_BUNDLE_TOKENS}" in _PROPOSER_SYSTEM_PROMPT, (
+    "MAX_BUNDLE_TOKENS must appear verbatim in the proposer prompt"
+)
 
 
 def _make_proposer_tools(
@@ -1098,6 +1180,20 @@ def propose_candidates(
                 iter_n,
                 slot,
                 f"validate_error:skill_too_large:{tokens}",
+                None,
+                reasoning[:80],
+            )
+            shutil.rmtree(candidate_bundle, ignore_errors=True)
+            continue
+
+        # Whole-bundle token cap.
+        bundle_tok = _bundle_tokens(candidate_bundle)
+        if bundle_tok > MAX_BUNDLE_TOKENS:
+            _append_history(
+                run_dir,
+                iter_n,
+                slot,
+                f"validate_error:bundle_too_large:{bundle_tok}",
                 None,
                 reasoning[:80],
             )

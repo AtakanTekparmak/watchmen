@@ -23,9 +23,7 @@ from pathlib import Path
 
 import httpx
 
-from .eval_builder import build_eval_set, calibrate_eval
-from .runner import build_skill_system_prompt, run_rollout_subprocess
-from .verifier import score_single
+from .eval_builder import _simple_split, build_eval_set, calibrate_eval
 
 
 # ─── Constants ─────────────────────────────────────────────────────────────
@@ -39,15 +37,15 @@ _PROPOSER_SYSTEM_TMPL = (
     "- Each question must be answerable from the SKILL.md content alone (no live infra needed)\n"
     "- Target load-bearing details: exact flag names, thresholds, file paths, provider names,\n"
     "  command patterns — things a general 30B model would guess wrong without the skill\n"
-    "- Avoid \"you had to be there\" tokens: no instance IDs, pod IPs, run names — use placeholders\n"
+    '- Avoid "you had to be there" tokens: no instance IDs, pod IPs, run names — use placeholders\n'
     "- Each answer must be concise (≤200 words) and directly answerable\n"
     "- Include a rubric that awards 1.0 for the specific load-bearing detail,\n"
     "  0.5 for the right general approach, 0.0 for wrong/missing the key point\n"
     "- Mix question types: script_gen (write a command/script), procedural_qa (explain a procedure),\n"
     "  fact_recall (what is the exact value of X)\n\n"
-    "Output JSON array: [{{\"question\": \"...\", \"answer\": \"...\", \"rubric\": \"...\", "
-    "\"type\": \"script_gen|procedural_qa|fact_recall\", "
-    "\"load_bearing_detail\": \"≤20 word description of what makes this question skill-specific\"}}]"
+    'Output JSON array: [{{"question": "...", "answer": "...", "rubric": "...", '
+    '"type": "script_gen|procedural_qa|fact_recall", '
+    '"load_bearing_detail": "≤20 word description of what makes this question skill-specific"}}]'
 )
 
 
@@ -352,7 +350,9 @@ def run_synth_eval_build(
     running_md_path = watchmen_home / "analyses" / project / "_running.md"
     claude_md_path = watchmen_home / "bundles" / project / "CLAUDE.md"
     try:
-        running_md_text = running_md_path.read_text(encoding="utf-8", errors="replace") if running_md_path.exists() else ""
+        running_md_text = (
+            running_md_path.read_text(encoding="utf-8", errors="replace") if running_md_path.exists() else ""
+        )
     except OSError:
         running_md_text = ""
     try:
@@ -484,32 +484,4 @@ def run_synth_eval_build(
         total_holdout=len(holdout),
     )
 
-    return train, holdout
-
-
-def _simple_split(evals: list[dict], seed: int) -> tuple[list[dict], list[dict]]:
-    """Fallback 50/50 split when dedup-gate fails (small synthetic sets).
-
-    Avoids the spec's ≥30 cluster requirement for the synthetic path, which
-    is intentionally allowed to run on tiny eval sets during bootstrap.
-    """
-    import random as _rand
-
-    rng = _rand.Random(seed)
-    by_stratum: dict[tuple, list[dict]] = {}
-    for e in evals:
-        key = (e.get("type"), bool(e.get("accepted")))
-        by_stratum.setdefault(key, []).append(e)
-    train: list[dict] = []
-    holdout: list[dict] = []
-    for items in by_stratum.values():
-        shuffled = list(items)
-        rng.shuffle(shuffled)
-        cut = len(shuffled) // 2
-        holdout.extend(shuffled[:cut])
-        train.extend(shuffled[cut:])
-    for e in train:
-        e["split"] = "train"
-    for e in holdout:
-        e["split"] = "holdout"
     return train, holdout

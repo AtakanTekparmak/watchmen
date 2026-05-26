@@ -14,6 +14,7 @@ evolution code directly so a per-run crash can't take the daemon down.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -22,8 +23,10 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from .corpus import query_sessions
 
 
 # ─── Constants ────────────────────────────────────────────────────────────
@@ -32,6 +35,105 @@ from pathlib import Path
 _TICK_SECONDS = 2 * 60 * 60  # 2h base cycle
 _DAILY_RUN_HOUR_LOCAL = 3  # 03:00 local
 _WEEKLY_CAL_DAY = 0  # Monday for weekly re-calibration
+
+MIN_NEW_SESSIONS_FOR_REBUILD = 5  # default for daemon flag
+MIN_RUN_INTERVAL_HOURS = 24  # default for re-evolution gate
+
+
+# ─── projects.json helpers ────────────────────────────────────────────────
+
+
+def _read_projects_json(watchmen_home: Path) -> dict:
+    """Read projects.json — handles both list-of-dicts and dict variants.
+
+    Mirrors `daycare.cli._read_projects_json` to avoid circular imports.
+    """
+    path = watchmen_home / "projects.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if isinstance(data, list):
+        return {entry["project_key"]: entry for entry in data if "project_key" in entry}
+    return data if isinstance(data, dict) else {}
+
+
+def _source_repo_for(watchmen_home: Path, project: str) -> str:
+    data = _read_projects_json(watchmen_home)
+    entry = data.get(project)
+    if isinstance(entry, dict):
+        sr = entry.get("source_repo")
+        if isinstance(sr, str):
+            return sr
+    return ""
+
+
+# ─── New-sessions and eval-set helpers ────────────────────────────────────
+
+
+def _count_new_sessions(db_path: Path, source_repo: str, since_iso: str | None) -> int:
+    """Count sessions for source_repo whose started_at > since_iso.
+
+    Uses query_sessions(days=36500) — NOT days=None (would TypeError).
+    """
+    rows = query_sessions(db_path, source_repo, days=36500)
+    if since_iso is None:
+        return len(rows)
+    return sum(1 for r in rows if r["started_at"] > since_iso)
+
+
+def _latest_session_ts(db_path: Path, source_repo: str) -> str | None:
+    """Return max(started_at) over matching sessions, or None."""
+    rows = query_sessions(db_path, source_repo, days=36500)
+    if not rows:
+        return None
+    return max(r["started_at"] for r in rows)
+
+
+def _hash_eval_set(eval_set_path: Path) -> str:
+    """Return sha256 hex of eval_set.jsonl file contents."""
+    h = hashlib.sha256()
+    h.update(eval_set_path.read_bytes())
+    return h.hexdigest()
+
+
+def _latest_eval_set_path(watchmen_home: Path, project: str) -> Path | None:
+    """Find most-recent completed run for `project` and return its eval_set.jsonl.
+
+    Scans watchmen_home / "daycare" / "runs" for dirs matching f"{project}-*",
+    sorts by name (ISO timestamps are lex-sortable), returns the newest one's
+    eval_set.jsonl if it exists, else falls through to the next newest.
+    Returns None if runs/ doesn't exist or no candidate has eval_set.jsonl.
+    """
+    runs_root = watchmen_home / "daycare" / "runs"
+    if not runs_root.exists():
+        return None
+    candidates = sorted(
+        (d for d in runs_root.iterdir() if d.is_dir() and d.name.startswith(f"{project}-")),
+        reverse=True,
+    )
+    for d in candidates:
+        p = d / "eval_set.jsonl"
+        if p.exists():
+            return p
+    return None
+
+
+def _hours_since(iso: str | None, now: datetime) -> float:
+    """Return elapsed hours since iso (ISO8601 string), or inf if None."""
+    if iso is None:
+        return float("inf")
+    try:
+        past = datetime.fromisoformat(iso)
+        if past.tzinfo is None:
+            past = past.replace(tzinfo=timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return (now - past).total_seconds() / 3600.0
+    except (ValueError, TypeError):
+        return float("inf")
 
 
 # ─── launchd (macOS) ──────────────────────────────────────────────────────
@@ -280,11 +382,20 @@ def _pick_top_skill(watchmen_home: Path) -> tuple[str, str] | None:
     return best[0], best[1]
 
 
-def run_daemon(watchmen_home: Path, api_key: str) -> None:
+def run_daemon(
+    watchmen_home: Path,
+    api_key: str,
+    min_new_sessions: int = MIN_NEW_SESSIONS_FOR_REBUILD,
+    min_run_interval_hours: float = MIN_RUN_INTERVAL_HOURS,
+) -> None:
     """Daemon inner loop.
 
     On each 2h tick:
       - Refresh selector ranking (cheap).
+      - Per-project flywheel: if ``min_new_sessions`` new corpus sessions
+        have arrived for a project, spawn ``daycare eval-build`` and (if
+        the eval set changed and ``min_run_interval_hours`` has elapsed
+        since the last evolution) spawn ``daycare run``.
       - If a daily run is due (03:00 local), spawn ``daycare run`` as a
         subprocess on the highest-priority skill.
       - On Mondays, log a re-calibration reminder (the actual
@@ -293,6 +404,8 @@ def run_daemon(watchmen_home: Path, api_key: str) -> None:
 
     SIGINT / SIGTERM flip the stop flag for clean shutdown.
     """
+    _min_sessions = min_new_sessions
+    _min_run_interval = min_run_interval_hours
     log_dir = watchmen_home / "daycare" / "daemon" / "logs"
     logger = _build_logger(log_dir)
 
@@ -342,6 +455,78 @@ def run_daemon(watchmen_home: Path, api_key: str) -> None:
                 project, slug = top
                 logger.info("tick: top skill is %s/%s", project, slug)
 
+            # Per-project incremental flywheel.
+            db_path = watchmen_home / "corpus.db"
+            projects_meta = _read_projects_json(watchmen_home)
+            state.setdefault("per_project", {})
+            for project in projects_meta.keys():
+                source_repo = _source_repo_for(watchmen_home, project)
+                if not source_repo:
+                    continue
+
+                state["per_project"].setdefault(
+                    project,
+                    {
+                        "last_seen_session_ts": None,
+                        "last_eval_build_ts": None,
+                        "last_eval_set_hash": None,
+                        "last_evolution_run_ts": None,
+                        "new_sessions_since_build": 0,
+                    },
+                )
+
+                spawn_env = {
+                    **os.environ,
+                    "WATCHMEN_HOME": str(watchmen_home),
+                    "OPENROUTER_API_KEY": api_key,
+                }
+
+                new_count = _count_new_sessions(
+                    db_path,
+                    source_repo,
+                    state["per_project"][project].get("last_seen_session_ts"),
+                )
+                if new_count >= _min_sessions:
+                    logger.info(
+                        "project %s has %d new sessions; spawning eval-build",
+                        project,
+                        new_count,
+                    )
+                    proc = subprocess.Popen(
+                        [daycare_bin, "eval-build", project, "--behavioral"],
+                        env=spawn_env,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+                    proc.wait()  # synchronous
+                    state["per_project"][project]["last_eval_build_ts"] = now.isoformat()
+                    state["per_project"][project]["last_seen_session_ts"] = _latest_session_ts(
+                        db_path,
+                        source_repo,
+                    )
+                    state["per_project"][project]["new_sessions_since_build"] = 0
+
+                    # Re-evolution gate.
+                    eval_set_path = _latest_eval_set_path(watchmen_home, project)
+                    if eval_set_path is not None and eval_set_path.exists():
+                        new_hash = _hash_eval_set(eval_set_path)
+                        prev_hash = state["per_project"][project].get("last_eval_set_hash")
+                        last_run_iso = state["per_project"][project].get("last_evolution_run_ts")
+                        hours_elapsed = _hours_since(last_run_iso, now)
+                        if new_hash != prev_hash and hours_elapsed >= _min_run_interval:
+                            logger.info(
+                                "project %s eval set changed; spawning run",
+                                project,
+                            )
+                            subprocess.Popen(
+                                [daycare_bin, "run", project, "--eval-set", str(eval_set_path), "--yes"],
+                                env=spawn_env,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                            )
+                            state["per_project"][project]["last_evolution_run_ts"] = now.isoformat()
+                        state["per_project"][project]["last_eval_set_hash"] = new_hash
+
             # Daily run gate.
             if top is not None and _is_daily_run_due(last_daily_run, now):
                 project, slug = top
@@ -373,12 +558,14 @@ def run_daemon(watchmen_home: Path, api_key: str) -> None:
                 logger.info("weekly re-calibration due — next daycare run will refresh evals")
                 last_weekly = now
 
-            # Persist state.
+            # Persist state — preserve per_project across overwrites.
+            existing_per_project = state.get("per_project", {})
             state = {
                 "last_daily_run": last_daily_run.isoformat() if last_daily_run else None,
                 "last_weekly": last_weekly.isoformat() if last_weekly else None,
                 "last_tick": now.isoformat(),
             }
+            state["per_project"] = existing_per_project
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
         except Exception as exc:  # noqa: BLE001 — never let one tick kill the daemon

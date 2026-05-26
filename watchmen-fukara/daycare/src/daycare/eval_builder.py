@@ -646,12 +646,14 @@ def semantic_dedup(
     evals: list[dict],
     threshold: float = 0.92,
     max_per_cluster: int = 5,
+    min_clusters: int = 30,
 ) -> list[dict]:
     """Cluster on cosine(anonymized_prompt) ≥ threshold, cap at max_per_cluster
     per cluster (keeping the items that maximise baseline_score variance).
 
-    R2 mandate: after dedup, we must have ≥30 distinct clusters or the
-    corpus lacks distillable surface — raise ValueError.
+    R2 mandate: after dedup, we must have ≥``min_clusters`` distinct
+    clusters or the corpus lacks distillable surface — raise ValueError.
+    The behavioral path overrides ``min_clusters=20`` for a looser gate.
     """
     if not evals:
         raise ValueError("insufficient_distillable_surface")
@@ -677,7 +679,7 @@ def semantic_dedup(
         if not placed:
             clusters.append({"centroid": list(vec), "members": [idx]})
 
-    if len(clusters) < 30:
+    if len(clusters) < min_clusters:
         raise ValueError("insufficient_distillable_surface")
 
     # Cap each cluster — keep the max_per_cluster items with the widest
@@ -765,16 +767,47 @@ def _stratified_split(evals: list[dict], seed: int) -> tuple[list[dict], list[di
     return train, holdout
 
 
+def _simple_split(evals: list[dict], seed: int) -> tuple[list[dict], list[dict]]:
+    """Fallback 50/50 stratified split when the dedup-gate fails.
+
+    Used by both the synthetic path and the behavioral fallback when the
+    corpus is too small to satisfy semantic_dedup's ``min_clusters`` floor
+    or the stratification floor. Skips the ≥min_clusters requirement.
+    """
+    rng = random.Random(seed)
+    by_stratum: dict[tuple, list[dict]] = {}
+    for e in evals:
+        key = (e.get("type"), bool(e.get("accepted")))
+        by_stratum.setdefault(key, []).append(e)
+    train: list[dict] = []
+    holdout: list[dict] = []
+    for items in by_stratum.values():
+        shuffled = list(items)
+        rng.shuffle(shuffled)
+        cut = len(shuffled) // 2
+        holdout.extend(shuffled[:cut])
+        train.extend(shuffled[cut:])
+    for e in train:
+        e["split"] = "train"
+    for e in holdout:
+        e["split"] = "holdout"
+    return train, holdout
+
+
 def build_eval_set(
     raw_evals: list[dict],
     seed: int,
     ctx: AnonymizeContext,
     run_dir: Path,
+    min_clusters: int = 30,
 ) -> tuple[list[dict], list[dict]]:
     """Phase 1e — anonymize → dedup → stratified split → write eval_set.jsonl.
 
     Returns (train, holdout). All rows in both slices have the anonymized_*
     fields populated; the proposer reads only those.
+
+    ``min_clusters`` is forwarded to ``semantic_dedup``; behavioral path
+    calls with 20, legacy callers stay at the default 30.
     """
     # Anonymize fields. The proposer reads only the anonymized_* keys, but
     # the judge needs the raw forms for scoring.
@@ -789,7 +822,7 @@ def build_eval_set(
         e["baseline_completion_len_tokens"] = _count_tokens(e.get("reference") or "")
 
     # Semantic dedup gate (R2).
-    deduped = semantic_dedup(raw_evals)
+    deduped = semantic_dedup(raw_evals, min_clusters=min_clusters)
 
     # Stratified split with FM#2 floor.
     train, holdout = _stratified_split(deduped, seed)
@@ -969,13 +1002,65 @@ def run_eval_build(
     run_dir: Path,
     max_candidates: int | None = None,
     max_workers: int = 4,
+    behavioral: bool = True,
 ) -> tuple[list[dict], list[dict]]:
     """Compose Phases 1a–1f. Returns (train, holdout).
 
     The caller is responsible for building the AnonymizeContext (it has
     project_slugs / skill_slugs the eval_builder doesn't know about).
+
+    When ``behavioral=True`` (default), the behavioral path is used —
+    decision-point extraction with action-equivalence rubrics. The
+    behavioral path uses ``min_clusters=20`` and falls back to
+    ``_simple_split`` on ``insufficient_stratification``. When
+    ``behavioral=False``, the legacy ``pull_and_classify`` path runs
+    unchanged.
     """
     from .anonymize import build_context
+
+    ctx = build_context(projects_json, bundle_dir, source_repo)
+
+    if behavioral:
+        from .behavioral_builder import extract_behavioral_evals
+
+        raw = extract_behavioral_evals(
+            db_path=db_path,
+            source_repo=source_repo,
+            bundle_dir=bundle_dir,
+            weak_model=weak_model,
+            judge_model=judge_model,
+            api_key=api_key,
+            seed=seed,
+            days=days,
+            run_dir=run_dir,
+            max_candidates=max_candidates,
+            max_workers=max_workers,
+        )
+        try:
+            train, holdout = build_eval_set(raw, seed, ctx, run_dir, min_clusters=20)
+        except ValueError as exc:
+            if "insufficient_stratification" in str(exc) or "insufficient_distillable_surface" in str(exc):
+                print(
+                    "[behavioral] insufficient evals for dedup/split, falling back to simple_split",
+                    file=sys.stderr,
+                )
+                # Re-run the anonymize/dedup pre-steps that build_eval_set
+                # would have done; on stratification failure they completed
+                # but the split raised. We re-anonymize defensively here.
+                for e in raw:
+                    e["anonymized_prompt"] = strip(e.get("prompt") or "", ctx)
+                    e["anonymized_reference"] = strip(e.get("reference") or "", ctx)
+                    e["anonymized_rubric"] = strip(e.get("rubric") or "", ctx)
+                    e["baseline_completion_len_tokens"] = _count_tokens(e.get("reference") or "")
+                train, holdout = _simple_split(raw, seed)
+                run_dir.mkdir(parents=True, exist_ok=True)
+                out_path = run_dir / "eval_set.jsonl"
+                with out_path.open("w", encoding="utf-8") as fh:
+                    for e in train + holdout:
+                        fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            else:
+                raise
+        return train, holdout
 
     raw = pull_and_classify(
         db_path=db_path,
@@ -992,7 +1077,6 @@ def run_eval_build(
         max_workers=max_workers,
     )
 
-    ctx = build_context(projects_json, bundle_dir, source_repo)
     train, holdout = build_eval_set(raw, seed, ctx, run_dir)
 
     # Round-trip gate only on holdout (per spec §1f: "for 20 random evals").

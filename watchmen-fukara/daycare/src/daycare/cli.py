@@ -207,7 +207,7 @@ def doctor() -> None:
 @click.option("--days", default=60, type=int, show_default=True)
 @click.option("--seed", default=42, type=int, show_default=True)
 @click.option("--weak-model", default="qwen/qwen3.6-27b", show_default=True)
-@click.option("--judge-model", default="anthropic/claude-haiku-4.5", show_default=True)
+@click.option("--judge-model", default="deepseek/deepseek-v4-pro", show_default=True)
 @click.option("--skill", "skill_slug", default=None, help="override auto-selection")
 @click.option("--max-candidates", default=None, type=int, help="sample N triples before LLM calls (testing)")
 @click.option("--max-workers", default=4, type=int, show_default=True, help="parallel LLM call workers")
@@ -234,6 +234,14 @@ def doctor() -> None:
     show_default=True,
     help="(synthetic only) proposer model for question generation",
 )
+@click.option(
+    "--behavioral/--no-behavioral",
+    default=None,
+    show_default=False,
+    help="Extract behavioral action evals from corpus turns (default unless "
+    "--synthetic is passed). --no-behavioral falls back to the legacy "
+    "classify-by-type path.",
+)
 def eval_build(
     project: str,
     days: int,
@@ -247,10 +255,18 @@ def eval_build(
     synthetic: bool,
     n_per_skill: int,
     proposer: str,
+    behavioral: bool | None,
 ) -> None:
     """Phase 1 only — dump eval_set.jsonl + report."""
     from .corpus import parse_transcript, query_sessions
     from .eval_builder import run_eval_build
+
+    # Resolve --behavioral default and check mutual exclusion.
+    # Note: in eval-build, the --synthetic flag variable is named `synthetic`
+    if behavioral is None:
+        behavioral = not synthetic  # default True unless --synthetic given
+    if behavioral and synthetic:
+        raise click.BadParameter("--behavioral and --synthetic are mutually exclusive")
 
     watchmen_home = _get_watchmen_home()
     projects = _read_projects_json(watchmen_home)
@@ -328,6 +344,7 @@ def eval_build(
                 run_dir=run_dir,
                 max_candidates=max_candidates,
                 max_workers=max_workers,
+                behavioral=behavioral,
             )
         except ValueError as exc:
             raise click.ClickException(f"eval-build aborted: {exc}") from exc
@@ -382,7 +399,7 @@ def _existing_runs(watchmen_home: Path) -> list[Path]:
 @click.option("--seed", default=42, type=int, show_default=True)
 @click.option("--weak-model", default="qwen/qwen3.6-27b", show_default=True)
 @click.option("--proposer", default="deepseek/deepseek-v4-pro", show_default=True)
-@click.option("--judge", default="anthropic/claude-haiku-4.5", show_default=True)
+@click.option("--judge", default="deepseek/deepseek-v4-pro", show_default=True)
 @click.option(
     "--teacher",
     default="anthropic/claude-opus-4.7",
@@ -415,6 +432,14 @@ def _existing_runs(watchmen_home: Path) -> list[Path]:
 )
 @click.option("--n-questions", default=10, type=int, show_default=True, help="(--synthetic) questions per skill")
 @click.option(
+    "--behavioral/--no-behavioral",
+    default=None,
+    show_default=False,
+    help="Extract behavioral action evals from corpus turns (default unless "
+    "--synthetic is passed). --no-behavioral falls back to the legacy "
+    "classify-by-type path.",
+)
+@click.option(
     "--yes",
     "yes_flag",
     is_flag=True,
@@ -440,6 +465,7 @@ def run(
     eval_set_path_override: str | None,
     synthetic_evals: bool,
     n_questions: int,
+    behavioral: bool | None,
     yes_flag: bool,
 ) -> None:
     """Full Phases 0-5 orchestration."""
@@ -454,6 +480,13 @@ def run(
     from .providers import ping_model
     from .selector import rank_skills
     from .watchdog import Watchdog
+
+    # Resolve --behavioral default and check mutual exclusion.
+    # Note: in the `run` command, --synthetic is stored as `synthetic_evals`
+    if behavioral is None:
+        behavioral = not synthetic_evals  # default True unless --synthetic given
+    if behavioral and synthetic_evals:
+        raise click.BadParameter("--behavioral and --synthetic are mutually exclusive")
 
     watchmen_home = _get_watchmen_home()
     projects = _read_projects_json(watchmen_home)
@@ -581,6 +614,7 @@ def run(
         eval_set_path = run_dir / "eval_set.jsonl"
         if eval_set_path_override and not eval_set_path.exists():
             import shutil
+
             shutil.copy2(eval_set_path_override, eval_set_path)
             console.print(f"[dim]Phase 1: copied eval_set from {eval_set_path_override}[/dim]")
         if eval_set_path.exists():
@@ -602,6 +636,7 @@ def run(
             if synthetic_evals:
                 console.print("[bold]Phase 1[/bold] — synthetic eval generation")
                 from .synth_builder import run_synth_eval_build
+
                 train, holdout = run_synth_eval_build(
                     bundle_dir=bundle_dir,
                     watchmen_home=watchmen_home,
@@ -629,6 +664,7 @@ def run(
                     seed=seed,
                     days=60,
                     run_dir=run_dir,
+                    behavioral=behavioral,
                 )
 
         epsilon = max(0.01, 1.0 / max(1, len(holdout)))
@@ -891,13 +927,20 @@ def daemon_uninstall() -> None:
 
 
 @daemon_group.command("run")
-def daemon_run() -> None:
+@click.option("--min-new-sessions", default=5, type=int, show_default=True)
+@click.option("--min-run-interval-hours", default=24, type=float, show_default=True)
+def daemon_run(min_new_sessions: int, min_run_interval_hours: float) -> None:
     """Run the daemon loop in the foreground (called by launchd/systemd)."""
     from . import daemon as daemon_mod
 
     watchmen_home = _get_watchmen_home()
     api_key = os.environ.get("OPENROUTER_API_KEY") or ""
-    daemon_mod.run_daemon(watchmen_home, api_key)
+    daemon_mod.run_daemon(
+        watchmen_home,
+        api_key,
+        min_new_sessions=min_new_sessions,
+        min_run_interval_hours=min_run_interval_hours,
+    )
 
 
 if __name__ == "__main__":
