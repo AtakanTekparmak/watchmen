@@ -576,6 +576,90 @@ def _dump_history(out: Path, history: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _add_patch_args(parser: argparse.ArgumentParser) -> None:
+    """Group A — patch-format + smoke-test flags.
+
+    Lives in its own helper so Group B can add ``_add_eval_source_args``
+    to the same ``_cli()`` without textual conflict (plan section 7d).
+    """
+    parser.add_argument(
+        "--patch-format",
+        choices=["json-ops", "sentinel-blocks"],
+        default="json-ops",
+        help=(
+            "outer-LLM patch format. ``json-ops`` (default) uses the "
+            "existing JSON-op planner; ``sentinel-blocks`` uses the "
+            "daycare-style ADD_FILE / EDIT_FILE / DELETE_FILE / "
+            "REWRITE_FOLDER format with smoke-test gating."
+        ),
+    )
+    parser.add_argument(
+        "--smoke-test",
+        dest="smoke_test",
+        action="store_true",
+        default=True,
+        help=(
+            "run py_compile/bash -n on every candidate script before "
+            "scoring; reject candidates with broken syntax (default on)"
+        ),
+    )
+    parser.add_argument(
+        "--no-smoke-test",
+        dest="smoke_test",
+        action="store_false",
+        help="skip syntax validation; candidates are scored as-is",
+    )
+
+
+def _add_eval_source_args(parser: argparse.ArgumentParser) -> None:
+    """Group B — --eval-source + behavioral adapter + validation-task-list.
+
+    Symmetric with :func:`_add_patch_args`; lives in its own helper so
+    Group A and Group B can both add argparse args to ``_cli()`` without
+    textual conflict (plan section 7d). Track A is sentinel-mode by
+    config, but exposing the same UX as Track B keeps the two CLIs
+    consistent for users who switch between them.
+    """
+    parser.add_argument(
+        "--eval-source",
+        choices=("skillsbench", "behavioral"),
+        default="skillsbench",
+        help=(
+            "Scoring backend. ``skillsbench`` (default) preserves the "
+            "existing TBLite/SkillsBench agent-harness scoring. "
+            "``behavioral`` scores candidates via a judge LLM against "
+            "a daycare-format ``eval_set.jsonl`` (requires --eval-set)."
+        ),
+    )
+    parser.add_argument(
+        "--eval-set",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a daycare-style ``eval_set.jsonl`` (required when "
+            "--eval-source=behavioral)."
+        ),
+    )
+    parser.add_argument(
+        "--judge-model",
+        type=str,
+        default=None,
+        help=(
+            "OpenRouter slug for the behavioral judge LLM. Required when "
+            "--eval-source=behavioral and no stub is wired in."
+        ),
+    )
+    parser.add_argument(
+        "--validation-task-list",
+        type=Path,
+        default=None,
+        help=(
+            "Optional held-out task list scored after each accepted "
+            "winner (records ``validation_score`` on the artifact)."
+        ),
+    )
+
+
 def _cli(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m skill_evolve.track_a.runner",
@@ -639,6 +723,8 @@ def _cli(argv: Optional[List[str]] = None) -> int:
         help="restrict benchmark sources (e.g. tblite swebench)",
     )
     ap.add_argument("--rng-seed", type=int, default=None)
+    _add_eval_source_args(ap)
+    _add_patch_args(ap)
     args = ap.parse_args(argv)
 
     logging.basicConfig(

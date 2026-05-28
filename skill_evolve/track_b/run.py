@@ -64,7 +64,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-generations", type=int, default=30)
     p.add_argument("--num-islands", type=int, default=3)
     p.add_argument("--migration-interval", type=int, default=5)
-    p.add_argument("--rng-seed", type=int, default=0)
+    # kai-skills patch (Group E, 2026-05-28): default flipped 0 -> None per
+    # plan section 4b replicability paragraph. Unseeded by default (opt-in
+    # seeding for multi-roll replicability protocol). When set, the controller
+    # threads the seed into the proposer LLM client's seed= kwarg in addition
+    # to the existing RNG seeding.
+    p.add_argument("--rng-seed", type=int, default=None)
     p.add_argument(
         "--max-workers",
         type=int,
@@ -163,6 +168,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "When unset, the full manifest is used (existing behaviour).",
     )
     p.add_argument(
+        "--agent",
+        type=str,
+        default="claude-code",
+        choices=("claude-code", "gemini"),
+        help="Inner agent harness for SkillsBench evals. Default: claude-code.",
+    )
+    p.add_argument(
         "--leak-policy",
         choices=("warn", "zero", "raise"),
         default="zero",
@@ -173,8 +185,217 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     # kai-skills patch end (Phase E)
 
+    # kai-skills patch (Group B, 2026-05-27): --eval-source flag +
+    # behavioral adapter + held-out validation split. Defaults preserve
+    # the existing SkillsBench / tblite scoring path. When
+    # ``--eval-source behavioral`` is selected, ``--eval-set`` must
+    # point at a daycare-format ``eval_set.jsonl``. ``--validation-task-list``
+    # triggers a second eval pass after a winner is accepted; the
+    # validation score is recorded on the artifact (no re-acceptance
+    # gate — recorded only).
+    p.add_argument(
+        "--eval-source",
+        choices=("skillsbench", "behavioral"),
+        default="skillsbench",
+        help=(
+            "Scoring backend. ``skillsbench`` (default) preserves the "
+            "existing TBLite/SkillsBench agent-harness scoring. "
+            "``behavioral`` scores candidates via a judge LLM against "
+            "a daycare-format ``eval_set.jsonl`` (requires --eval-set)."
+        ),
+    )
+    p.add_argument(
+        "--eval-set",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a daycare-style ``eval_set.jsonl`` (required when "
+            "--eval-source=behavioral)."
+        ),
+    )
+    p.add_argument(
+        "--judge-model",
+        type=str,
+        default=None,
+        help=(
+            "OpenRouter slug for the behavioral judge LLM. Required when "
+            "--eval-source=behavioral and no stub is wired in."
+        ),
+    )
+    p.add_argument(
+        "--validation-task-list",
+        type=Path,
+        default=None,
+        help=(
+            "Optional held-out task list scored after each accepted "
+            "winner. Recorded on the artifact as ``validation_score``; "
+            "does NOT re-gate acceptance."
+        ),
+    )
+    # kai-skills patch (Group F, 2026-05-28): bounded edit-budget L_t
+    # scheduler. Caps the number of file ops applied per iteration,
+    # mirroring SkillOpt's paper-default cosine taper from 8 down to 2.
+    # See ``skill_evolve.shared.edit_budget`` for spec grammar. F is the
+    # first second-pass group in §7n's append order; subsequent groups
+    # (E/G/H) append their args AFTER this block.
+    p.add_argument(
+        "--edit-budget",
+        type=str,
+        default="cosine:8->2",
+        help=(
+            "Per-iteration L_t cap on file ops. Spec: ``constant:N``, "
+            "``linear:N->M``, or ``cosine:N->M``. Default ``cosine:8->2`` "
+            "matches the SkillOpt paper. Surplus ops are dropped in "
+            "proposer-emit order before the smoke gate."
+        ),
+    )
+    # kai-skills patch (Group E, 2026-05-28): strict validation gate +
+    # rejected-edit buffer. Plan section 7j locks the gate semantics:
+    #   * strict   (default): accept iff train_score >= parent_train AND
+    #                          val_score > best_val_score_seen_so_far.
+    #                          Ties on val_score REJECTED.
+    #   * record:             plan_0 Group-B behavior — record val_score
+    #                          on artifact; accept on train criterion.
+    #   * relaxed:            accept iff train_score >= parent_train AND
+    #                          val_score >= best_val_score_seen_so_far
+    #                          (ties accepted).
+    # --rejected-buffer-size caps the bounded ring of recent rejections
+    # surfaced to the proposer prompt; --max-proposer-prompt-tokens caps
+    # the rendered prompt size before any LLM call (3-stage degradation).
+    p.add_argument(
+        "--validation-gate",
+        choices=("strict", "record", "relaxed"),
+        default="strict",
+        help=(
+            "Acceptance gate for the held-out validation eval. "
+            "strict (default): train >= parent AND val > best-seen "
+            "(ties rejected). record: plan_0 Group-B behavior — accept "
+            "on train criterion, record val. relaxed: train >= parent "
+            "AND val >= best-seen (ties accepted)."
+        ),
+    )
+    p.add_argument(
+        "--rejected-buffer-size",
+        type=int,
+        default=10,
+        help=(
+            "Capacity of the bounded rejected-edit ring shown to the "
+            "proposer prompt (default: 10)."
+        ),
+    )
+    p.add_argument(
+        "--max-proposer-prompt-tokens",
+        type=int,
+        default=90000,
+        help=(
+            "Hard pre-LLM cap on the rendered proposer prompt. When "
+            "exceeded, the renderer degrades gracefully: "
+            "(1) truncate rejected-buffer entries oldest-first, "
+            "(2) truncate meta-skill tail oldest-iter-first, "
+            "(3) truncate bundle context keeping SKILL.md + frontmatter "
+            "+ first N scripts/* in list_scripts order. Default: 90000."
+        ),
+    )
+    # kai-skills patch (Group H, 2026-05-28): success/failure minibatch
+    # partition reflection (SkillOpt port). Per plan section 7m, the
+    # ``partition`` mode forks the single proposer call into two parallel
+    # calls (failure / success reflection) and merges via a keyed-dict
+    # resolver in ``shared.reflection.merge_patches``. H is SECOND in §7n
+    # Round 2 append order — these args go AFTER E's block and BEFORE G's
+    # (G rebases later and appends its own flags).
+    p.add_argument(
+        "--reflection-mode",
+        choices=("single", "partition"),
+        default="partition",
+        help=(
+            "Proposer call shape. ``partition`` (default) runs TWO "
+            "parallel proposer calls (failure-pattern + success-pattern "
+            "reflection) and merges via failure-priority keyed-dict "
+            "resolver. ``single`` preserves the back-compat one-call "
+            "path."
+        ),
+    )
+    p.add_argument(
+        "--reflection-batch-size",
+        type=int,
+        default=8,
+        help=(
+            "Per-side minibatch cap B_m for partition-mode reflection "
+            "(paper default 8). On hot_5 this just acts as a per-side "
+            "cap since the eval set has 5 tasks total."
+        ),
+    )
+    p.add_argument(
+        "--reflection-success-threshold",
+        type=float,
+        default=0.5,
+        help=(
+            "Per-task score cutoff for the failure / success partition. "
+            "Boundary score == threshold goes to success (``>=``). "
+            "Default 0.5 matches the behavioral-judge threshold."
+        ),
+    )
+    # kai-skills patch (Group G, 2026-05-28; plan §7l + §7n): slow-update
+    # protected region + meta-skill consolidator. G is the LAST second-pass
+    # group to append to this block per §7n Round 2 (H first, then G).
+    #   * --slow-update-every K: consolidator fires every K iters (default 4).
+    #   * --meta-skill-path: on-disk audit log path (default <out>/meta_skill.md).
+    #   * --consolidator-model: separate slug for the slow-update LLM
+    #     (default: mirror --outer-model so a one-model run still works).
+    #   * --meta-skill-max-iters: tail-truncation cap on the audit log
+    #     (default 20, matches plan §4b context-budget projection).
+    #   * --persistent-failure-window: a task counts as "persistent failure"
+    #     once it has failed in this many consecutive iters (default 3).
+    p.add_argument(
+        "--slow-update-every",
+        type=int,
+        default=4,
+        help=(
+            "Run the slow-update consolidator every K iterations (default "
+            "4). Set to a value > num_generations to effectively disable."
+        ),
+    )
+    p.add_argument(
+        "--meta-skill-path",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the rolling meta-skill audit log (markdown). Default "
+            "<out>/meta_skill.md. The file is training-only and never "
+            "shipped to the deployed bundle (plan §7l)."
+        ),
+    )
+    p.add_argument(
+        "--consolidator-model",
+        type=str,
+        default=None,
+        help=(
+            "Model slug for the slow-update consolidator LLM. Default: "
+            "mirror --outer-model so a single-model run still works."
+        ),
+    )
+    p.add_argument(
+        "--meta-skill-max-iters",
+        type=int,
+        default=20,
+        help=("Tail-truncation cap on the meta-skill audit log (default 20)."),
+    )
+    p.add_argument(
+        "--persistent-failure-window",
+        type=int,
+        default=3,
+        help=(
+            "A task counts as persistent-failure when it has failed in "
+            "this many consecutive iters (default 3)."
+        ),
+    )
     p.add_argument("--verbose", "-v", action="store_true")
     return p
+
+
+# kai-skills patch (Group E, 2026-05-28): public alias for plan section
+# E acceptance check (``from track_b.run import build_parser``).
+build_parser = _build_parser
 
 
 def _cost_warning(args: argparse.Namespace) -> None:
@@ -215,6 +436,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.seed.is_dir():
         print(f"seed folder not found: {args.seed}", file=sys.stderr)
+        return 2
+
+    # kai-skills patch (Group F, 2026-05-28): fail fast on a malformed
+    # --edit-budget spec so a 12-hour run doesn't crash mid-iter when
+    # the first non-zero gen tries to compute L_t.
+    from skill_evolve.shared.edit_budget import parse_schedule as _parse_schedule
+
+    try:
+        _parse_schedule(args.edit_budget)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
     # kai-skills patch (Phase E, 2026-04-29): when --task-source
@@ -285,6 +517,33 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
+    # kai-skills patch (Group B, 2026-05-27): validate behavioral inputs
+    # before we start spinning up workers. Failure modes:
+    #   * --eval-source behavioral but no --eval-set → ValueError mirrors
+    #     skill_evolve.evaluator.evaluate (single source of truth).
+    #   * --eval-source behavioral but --eval-set path missing on disk →
+    #     fail fast before evolution loop launches a single judge call.
+    if args.eval_source == "behavioral":
+        if args.eval_set is None:
+            print(
+                "ERROR: --eval-set required when --eval-source behavioral",
+                file=sys.stderr,
+            )
+            return 2
+        if not Path(args.eval_set).exists():
+            print(
+                f"ERROR: --eval-set {args.eval_set} does not exist",
+                file=sys.stderr,
+            )
+            return 2
+        if not args.force_synthetic and not args.judge_model:
+            print(
+                "ERROR: --judge-model is required for live "
+                "--eval-source=behavioral runs",
+                file=sys.stderr,
+            )
+            return 2
+
     args.out.mkdir(parents=True, exist_ok=True)
     _cost_warning(args)
 
@@ -302,6 +561,13 @@ def main(argv: list[str] | None = None) -> int:
         agent_backend=args.agent_backend,
         task_list=args.task_list,
         leak_policy=args.leak_policy,
+        # Phase E v7 patch (2026-05-05): inner agent selection
+        agent=args.agent,
+        # kai-skills patch (Group B, 2026-05-27): eval-source plumbing
+        eval_source=args.eval_source,
+        eval_set_path=args.eval_set,
+        judge_model=args.judge_model,
+        validation_task_list=args.validation_task_list,
     )
     llm = build_default_client(
         force_synthetic=args.force_synthetic,
@@ -314,6 +580,38 @@ def main(argv: list[str] | None = None) -> int:
         num_islands=args.num_islands,
         migration_interval=args.migration_interval,
         rng_seed=args.rng_seed,
+        # kai-skills patch (Group F, 2026-05-28): thread the bounded
+        # edit-budget L_t schedule spec end-to-end. Validated above; the
+        # iteration loop re-parses (cached parse is acceptable since
+        # parse_schedule is O(spec_len)).
+        edit_budget=args.edit_budget,
+        # kai-skills patch (Group B, 2026-05-27): held-out validation path.
+        validation_task_list=args.validation_task_list,
+        # kai-skills patch (Group E, 2026-05-28): strict gate + buffer
+        # plumbing per plan section 7j.
+        validation_gate=args.validation_gate,
+        rejected_buffer_size=args.rejected_buffer_size,
+        max_proposer_prompt_tokens=args.max_proposer_prompt_tokens,
+        # kai-skills patch (Group H, 2026-05-28): partition reflection
+        # plumbing per plan section 7m.
+        reflection_mode=args.reflection_mode,
+        reflection_batch_size=args.reflection_batch_size,
+        reflection_success_threshold=args.reflection_success_threshold,
+        # kai-skills patch (Group G, 2026-05-28; plan §7l): slow-update
+        # consolidator + meta-skill audit log plumbing.
+        slow_update_every=args.slow_update_every,
+        meta_skill_path=(
+            args.meta_skill_path
+            if args.meta_skill_path is not None
+            else args.out / "meta_skill.md"
+        ),
+        consolidator_model=(
+            args.consolidator_model
+            if args.consolidator_model is not None
+            else args.outer_model
+        ),
+        meta_skill_max_iters=args.meta_skill_max_iters,
+        persistent_failure_window=args.persistent_failure_window,
     )
 
     result = run_evolution(

@@ -115,6 +115,7 @@ class OpenRouterLLM:
         max_tokens: int = 20000,
         reasoning_max_tokens: Optional[int] = 2000,
         api_key: Optional[str] = None,
+        seed: Optional[int] = None,
     ) -> None:
         try:
             from openai import OpenAI  # type: ignore
@@ -123,6 +124,12 @@ class OpenRouterLLM:
         self._model = model
         self._max_tokens = max_tokens
         self._reasoning_max_tokens = reasoning_max_tokens
+        # kai-skills patch (Group E, 2026-05-28): optional request-level
+        # ``seed`` param for OpenRouter providers that honor determinism
+        # (OpenAI, Together, etc.). Threaded into ``chat.completions.create``
+        # below when not None so the canonical replicability protocol
+        # (n>=3 seeded runs) gets real per-call seeding.
+        self._seed = seed
         self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
         if not self._api_key:  # pragma: no cover
             raise RuntimeError("OPENROUTER_API_KEY not set")
@@ -152,6 +159,9 @@ class OpenRouterLLM:
             kwargs["extra_body"] = {
                 "reasoning": {"max_tokens": self._reasoning_max_tokens}
             }
+        # kai-skills patch (Group E, 2026-05-28): forward optional seed.
+        if self._seed is not None:
+            kwargs["seed"] = self._seed
         resp = self._client.chat.completions.create(**kwargs)
         msg = resp.choices[0].message
         content = msg.content or ""
@@ -225,4 +235,4 @@ def build_default_client(
             model,
         )
         return SyntheticLLM(seed=seed)
-    return OpenRouterLLM(model=model)
+    return OpenRouterLLM(model=model, seed=seed)

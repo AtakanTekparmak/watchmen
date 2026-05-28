@@ -18,7 +18,6 @@ evaluator can chew on it.
 from __future__ import annotations
 
 import copy
-import dataclasses
 import io
 import shutil
 from dataclasses import dataclass, field
@@ -124,7 +123,8 @@ class SkillFolder:
             if not skill_md.exists():
                 continue
             doc = _parse_skill_md(
-                child.name, skill_md.read_text(encoding="utf-8"),
+                child.name,
+                skill_md.read_text(encoding="utf-8"),
             )
             # Load auxiliary files from the 4 hermes-native subdirs.
             # Non-recognised subdirs are ignored so a ``tests/`` or
@@ -184,7 +184,18 @@ class SkillFolder:
 
     # ------------- persistence ------------------------------------------
 
-    def write(self, dest: Path) -> Path:
+    def write(self, dest: Path, *, smoke_test: bool = False) -> Path:
+        """Materialize the folder to ``dest``.
+
+        When ``smoke_test`` is True, after writing we run a syntax
+        validation pass (``py_compile`` on .py, ``bash -n`` on .sh)
+        plus a token-cap check via
+        :func:`skill_evolve.shared.bundle_ops.bundle_tokens`. On
+        failure we raise :class:`BundleRejected` so the runner pass
+        loop can record a "rejected" candidate without an eval call.
+        Default is False to preserve existing call-sites' behavior;
+        runner.py opts in based on ``--smoke-test``.
+        """
         dest = Path(dest).expanduser().resolve()
         if dest.exists():
             shutil.rmtree(dest)
@@ -201,11 +212,29 @@ class SkillFolder:
                 # extension get +x so the agent can ``bash`` / ``python3``
                 # them directly. Other aux files (refs/templates/assets)
                 # stay 0644.
-                if (
-                    rel.startswith("scripts/")
-                    and target.suffix in EXECUTABLE_EXTS
-                ):
+                if rel.startswith("scripts/") and target.suffix in EXECUTABLE_EXTS:
                     target.chmod(0o755)
+        if smoke_test:
+            # Import here to avoid a circular import at module load
+            # (shared/bundle_ops imports patch_parser which doesn't
+            # touch folder.py — but keeping the import local also keeps
+            # the cost out of the non-gated write path).
+            from skill_evolve.shared.bundle_ops import (
+                BundleRejected,
+                MAX_BUNDLE_TOKENS,
+                bundle_tokens,
+                validate_scripts,
+            )
+
+            smoke = validate_scripts(dest)
+            if not smoke.ok:
+                reasons = "; ".join(f"{rel}: {msg}" for rel, msg in smoke.failures)
+                raise BundleRejected(f"smoke_failed: {reasons}")
+            tokens = bundle_tokens(dest)
+            if tokens > MAX_BUNDLE_TOKENS:
+                raise BundleRejected(
+                    f"token_cap_exceeded: {tokens} > {MAX_BUNDLE_TOKENS}"
+                )
         return dest
 
     # ------------- introspection ----------------------------------------
@@ -254,6 +283,7 @@ class SkillFolder:
 # Parsing
 # ---------------------------------------------------------------------------
 
+
 def _parse_skill_md(folder_name: str, text: str) -> SkillDoc:
     """Split a SKILL.md into frontmatter dict + body string.
 
@@ -282,7 +312,7 @@ def _parse_skill_md(folder_name: str, text: str) -> SkillDoc:
         return SkillDoc(folder_name=folder_name, frontmatter={}, body=stripped)
 
     fm_text = "\n".join(lines[1:close_idx])
-    body = "\n".join(lines[close_idx + 1:]).lstrip("\n")
+    body = "\n".join(lines[close_idx + 1 :]).lstrip("\n")
     try:
         fm = yaml.safe_load(fm_text) or {}
     except yaml.YAMLError:

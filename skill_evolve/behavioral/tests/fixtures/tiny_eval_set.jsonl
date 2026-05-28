@@ -1,0 +1,2 @@
+{"id": "easy_task_1", "prompt": "Read README.md and report its first line.", "rubric": "Did the agent invoke a read tool on README.md and report the first line verbatim?", "expected_action": "read_file", "metadata": {"difficulty": "low"}}
+{"id": "hard_task_1", "prompt": "Identify which test failed in the last CI run.", "rubric": "Did the agent identify the failing test by name without guessing?", "expected_action": "grep_logs", "metadata": {"difficulty": "high"}}

@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from skill_evolve.shared.rejected_buffer import RejectedBuffer
+
 from .database import (
     Program,
     ProgramDatabase,
@@ -23,7 +25,7 @@ from .database import (
 from .evaluator import SkillFolderEvaluator
 from .folder_artifact import FolderArtifact
 from .islands import seed_variants
-from .iteration import IterationResult, run_iteration
+from .iteration import GateState, IterationResult, run_iteration
 from .llm_client import LLMClient
 from .prompt_sampler import PromptSampler
 
@@ -35,7 +37,52 @@ class RunConfig:
     num_generations: int = 30
     num_islands: int = 3
     migration_interval: int = 5
-    rng_seed: Optional[int] = 0
+    # kai-skills patch (Group E, 2026-05-28): default flipped 0 -> None to
+    # match the CLI flag's new opt-in semantics (plan section 4b
+    # replicability paragraph).
+    rng_seed: Optional[int] = None
+    # kai-skills patch (Group F, 2026-05-28): bounded edit-budget L_t
+    # schedule spec (``constant:N`` / ``linear:N->M`` / ``cosine:N->M``).
+    # ``None`` disables clipping (back-compat for callers that haven't
+    # opted in to the Group F flag).
+    edit_budget: Optional[str] = None
+    # kai-skills patch (Group B, 2026-05-27): held-out validation list
+    # path. Surface on RunConfig so the Group E gate can branch on
+    # acceptance without re-reading the evaluator.
+    validation_task_list: Optional[Path] = None
+    # kai-skills patch (Group E, 2026-05-28): strict validation gate +
+    # rejected-edit buffer plumbing per plan section 7j.
+    validation_gate: str = "strict"
+    rejected_buffer_size: int = 10
+    max_proposer_prompt_tokens: int = 90000
+    # kai-skills patch (Group H, 2026-05-28): success/failure minibatch
+    # partition reflection per plan section 7m. ``single`` keeps the
+    # back-compat one-proposer-call path; ``partition`` runs TWO parallel
+    # calls (failure / success reflection) and merges via failure-priority
+    # keyed-dict resolver.
+    reflection_mode: str = "single"
+    reflection_batch_size: int = 8
+    reflection_success_threshold: float = 0.5
+    # kai-skills patch (Group G, 2026-05-28; plan §7l): slow-update
+    # consolidator + meta-skill audit log plumbing.
+    #   * slow_update_every: K — consolidator fires every K iters
+    #     (default 4; > num_generations effectively disables).
+    #   * meta_skill_path: on-disk markdown audit log
+    #     (default None → run.py supplies <out>/meta_skill.md).
+    #   * consolidator_model: separate slug for the slow-update LLM
+    #     (default None → falls back to outer/proposer model).
+    #   * meta_skill_max_iters: tail-truncation cap (default 20).
+    #   * persistent_failure_window: a task counts as persistent failure
+    #     after this many consecutive failed iters (default 3).
+    slow_update_every: int = 4
+    meta_skill_path: Optional[Path] = None
+    consolidator_model: Optional[str] = None
+    meta_skill_max_iters: int = 20
+    persistent_failure_window: int = 3
+    # max_iters mirrors num_generations for the edit-budget schedule
+    # normalization; kept separate so future callers can clip schedule
+    # endpoints independently of the run length.
+    max_iters: Optional[int] = None
 
 
 @dataclass
@@ -173,6 +220,32 @@ def run_evolution(
     t_start = time.monotonic()
     best_so_far_fitness: float = float("-inf")
     best_so_far_dir = out_dir / "best_so_far"
+    # kai-skills patch (Group E, 2026-05-28): instantiate the per-run
+    # gate state + rejected-edit buffer ONCE so the strict gate can
+    # compare each candidate against the cross-iter ``best_val_seen``.
+    # Buffer is persisted to ``out_dir/rejected_buffer.jsonl`` after
+    # every rejection via the iteration helper (crash-safe).
+    gate_state = GateState()
+    rejected_buffer = RejectedBuffer(capacity=config.rejected_buffer_size)
+    rejected_buffer_path = out_dir / "rejected_buffer.jsonl"
+    # kai-skills patch (Group G, 2026-05-28; plan §7l): instantiate the
+    # per-run meta-skill audit log + persistent-failure tracker ONCE so
+    # the consolidator path can append cross-iter lessons without
+    # re-reading the file on every fire. The log is bounded to
+    # ``meta_skill_max_iters`` entries via tail-truncation on append.
+    from skill_evolve.shared.meta_skill import MetaSkill as _MetaSkill
+
+    meta_skill_path: Path = (
+        Path(config.meta_skill_path)
+        if config.meta_skill_path is not None
+        else (out_dir / "meta_skill.md")
+    )
+    meta_skill = _MetaSkill.from_markdown_file(
+        meta_skill_path, max_entries=config.meta_skill_max_iters
+    )
+    # Per-task failure-streak counters for the persistent-failure window.
+    # task_id -> int (consecutive failed iters since last pass).
+    persistent_failure_streaks: Dict[str, int] = {}
     for gen in range(1, config.num_generations + 1):
         island = (gen - 1) % config.num_islands
         try:
@@ -183,6 +256,33 @@ def run_evolution(
                 llm,
                 prompt_sampler,
                 island=island,
+                edit_budget=config.edit_budget,
+                max_iters=(
+                    config.max_iters
+                    if config.max_iters is not None
+                    else config.num_generations
+                ),
+                validation_gate=config.validation_gate,
+                rejected_buffer=rejected_buffer,
+                gate_state=gate_state,
+                rejected_buffer_path=rejected_buffer_path,
+                # kai-skills patch (Group H, 2026-05-28): partition
+                # reflection plumbing per plan section 7m. The artifact
+                # dir routes the three reflection JSON files to a
+                # per-run subdir so post-hoc inspectors can read them.
+                reflection_mode=config.reflection_mode,
+                reflection_success_threshold=(config.reflection_success_threshold),
+                reflection_artifact_dir=(out_dir / "reflection"),
+                # kai-skills patch (Group G, 2026-05-28; plan §7l):
+                # slow-update consolidator plumbing. The iteration loop
+                # owns the every-K-iters branch on top of the regular
+                # fast-edit path.
+                slow_update_every=config.slow_update_every,
+                meta_skill=meta_skill,
+                meta_skill_path=meta_skill_path,
+                consolidator_model=config.consolidator_model,
+                persistent_failure_streaks=persistent_failure_streaks,
+                persistent_failure_window=config.persistent_failure_window,
             )
         except LookupError as exc:
             logger.warning("iter %d: island %d empty (%s); skipping", gen, island, exc)
@@ -198,7 +298,10 @@ def run_evolution(
             ):
                 if best_so_far_dir.exists():
                     shutil.rmtree(best_so_far_dir)
-                current_best.artifact.write_to(best_so_far_dir)
+                # kai-skills patch (Group G, 2026-05-28; plan §7l):
+                # best_so_far is a deployment-side snapshot — strip
+                # ``meta_skill.md`` and other training-only artifacts.
+                current_best.artifact.write_to(best_so_far_dir, deployment=True)
                 (out_dir / "best_so_far_meta.json").write_text(
                     json.dumps(
                         {
@@ -261,7 +364,10 @@ def run_evolution(
             # with "cannot access local variable 'shutil'". The module-
             # level import at top of the file is the only one needed.
             shutil.rmtree(best_dir)
-        best.artifact.write_to(best_dir)
+        # kai-skills patch (Group G, 2026-05-28; plan §7l): best/ is the
+        # deployment artifact — strip ``meta_skill.md`` and other
+        # training-only files via deployment=True.
+        best.artifact.write_to(best_dir, deployment=True)
         # Surface the evaluator's side-channel artifacts (per-task detail,
         # invocation counts, unused-skills list, etc.) into best_meta so
         # post-run inspection can answer "which task did evolution crack?"
@@ -468,5 +574,11 @@ def _append_history(path: Path, res: IterationResult) -> None:
         "notes": res.notes,
         "metrics": res.metrics,
     }
+    # kai-skills patch (Group F, 2026-05-28): surface edit-budget
+    # bookkeeping (parsed/applied/lt/clipped) on the iteration history
+    # row when the iteration carried it. Omitted when None so legacy
+    # rows are byte-identical.
+    if res.edit_budget is not None:
+        payload["edit_budget"] = res.edit_budget
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload) + "\n")

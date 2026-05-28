@@ -103,17 +103,15 @@ SYNTHETIC_CANNED = {
         "## Iron Law\n\nMERGED\n\n"
         "## When to Use\n\n- Synthetic mode only.\n"
     ),
-    "synth": (
-        '{"skills": []}'
-    ),
+    "synth": ('{"skills": []}'),
     "new_script": (
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         "\n"
         "# Synthetic-mode placeholder script. Writes a marker to the first\n"
         "# positional argument (default /app/probe.txt) and exits 0.\n"
-        "OUT=\"${1:-/app/probe.txt}\"\n"
-        "echo \"ok $(date -Iseconds)\" > \"$OUT\"\n"
+        'OUT="${1:-/app/probe.txt}"\n'
+        'echo "ok $(date -Iseconds)" > "$OUT"\n'
     ),
     "rewrite_script": (
         "#!/usr/bin/env bash\n"
@@ -132,6 +130,12 @@ class LLMClient:
     synthetic: bool = False
     max_tokens: int = 4096
     temperature: float = 0.7
+    # kai-skills patch (2026-05-27 — daycare port): reasoning-mode budget
+    # cap. Mirrors track_b/llm_client.py:115-116. Reasoning models
+    # (kimi-k2.6, deepseek-v4-pro, deepseek-r-style) silently spend
+    # max_tokens on internal reasoning and return content="". Capping the
+    # reasoning budget leaves room for the visible response.
+    reasoning_max_tokens: Optional[int] = 2000
     _client: Optional[object] = None
 
     def __post_init__(self) -> None:
@@ -171,7 +175,10 @@ class LLMClient:
             return SYNTHETIC_CANNED.get(tag, "(synthetic placeholder response)")
 
         assert self._client is not None
-        resp = self._client.chat.completions.create(  # type: ignore[attr-defined]
+        # kai-skills patch (2026-05-27 — daycare port): cap the reasoning
+        # budget for reasoning-mode models. Mirrors
+        # track_b/openevolve_skills/llm_client.py:151-154.
+        kwargs: dict = dict(
             model=self.model,
             max_tokens=max_tokens or self.max_tokens,
             temperature=self.temperature if temperature is None else temperature,
@@ -180,4 +187,38 @@ class LLMClient:
                 {"role": "user", "content": user},
             ],
         )
-        return resp.choices[0].message.content or ""
+        if self.reasoning_max_tokens is not None:
+            kwargs["extra_body"] = {
+                "reasoning": {"max_tokens": self.reasoning_max_tokens}
+            }
+        resp = self._client.chat.completions.create(**kwargs)  # type: ignore[attr-defined]
+        msg = resp.choices[0].message
+        # kai-skills patch (2026-05-27 — daycare port): unified DeepSeek
+        # content/reasoning short-circuit. Some thinking-mode models
+        # (DeepSeek-v4-pro in particular) put the visible output in
+        # ``message.reasoning`` rather than ``message.content``. Daycare's
+        # verifier.py:189 uses ``msg.get("content") or msg.get("reasoning")
+        # or ""``; we apply the same idiom here. Cover both OpenAI-style
+        # (attribute access) and dict-style responses.
+        content = _get_field(msg, "content")
+        reasoning = _get_field(msg, "reasoning")
+        text = content or reasoning or ""
+        if not content and reasoning:
+            logger.warning(
+                "llm.complete: content empty, falling back to reasoning "
+                "field (model=%s, reasoning_len=%d)",
+                self.model,
+                len(reasoning),
+            )
+        return text
+
+
+def _get_field(msg: object, name: str) -> str:
+    """Read ``name`` off an SDK message — works for both attribute
+    (OpenAI-style) and mapping (OpenRouter raw dict) shapes.
+    """
+    if isinstance(msg, dict):
+        val = msg.get(name)
+    else:
+        val = getattr(msg, name, None)
+    return val or ""

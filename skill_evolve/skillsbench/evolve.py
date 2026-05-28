@@ -50,6 +50,34 @@ _DEFAULT_SUBSET_FOR_HOT12 = (
 )
 _SELECT_HOT_12_SCRIPT = _REPO_ROOT / "scripts" / "select_hot_12.py"
 
+# kai-skills patch (Group B, 2026-05-27): canonical task-set resolution.
+# Plan section 7i locks the resolution table:
+#   hot_5      -> runs/skillsbench_baseline_v2/hot_5.json
+#   subset_17  -> skill_evolve/skillsbench/subset_17.json
+# Any other name is treated as a path passed through verbatim.
+_CANONICAL_HOT_5 = _REPO_ROOT / "runs" / "skillsbench_baseline_v2" / "hot_5.json"
+_CANONICAL_SUBSET_17 = _DEFAULT_SUBSET_FOR_HOT12  # same physical path
+
+_TASK_SET_RESOLUTION: dict = {
+    "hot_5": _CANONICAL_HOT_5,
+    "subset_17": _CANONICAL_SUBSET_17,
+}
+
+
+def _resolve_task_set(name_or_path: Optional[str]) -> Optional[Path]:
+    """Resolve a task-set name to a Path per plan section 7i.
+
+    Known names route to the canonical table; everything else is
+    treated as a filesystem path and returned verbatim. ``None`` →
+    ``None`` so callers can keep their existing default logic.
+    """
+    if name_or_path is None:
+        return None
+    if name_or_path in _TASK_SET_RESOLUTION:
+        return _TASK_SET_RESOLUTION[name_or_path]
+    return Path(name_or_path)
+
+
 # Cost model: bench does not emit per-call cost; conservative fixed
 # multiplier matching ``baseline.COST_PER_TRIAL_USD``.
 _COST_PER_TRIAL_USD = 0.05
@@ -153,6 +181,217 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--agent",
+        type=str,
+        default="claude-code",
+        choices=("claude-code", "gemini"),
+        help=(
+            "Inner agent harness. Default: %(default)s (Anthropic CLI). "
+            "Use 'gemini' for Google's Gemini CLI (requires GEMINI_API_KEY "
+            "or GOOGLE_API_KEY in env, escapes the Anthropic 20MB/hr cap)."
+        ),
+    )
+    # kai-skills patch (Group B, 2026-05-27): canonical preset +
+    # task-set name resolution + eval-source forwarding. ``--canonical``
+    # injects the consolidated v0 config from plan section 4. The four
+    # eval-source flags (--eval-source / --eval-set / --judge-model /
+    # --validation-task-list) are forwarded to track_b.run.
+    p.add_argument(
+        "--canonical",
+        action="store_true",
+        help=(
+            "Inject the consolidated v0 config: inner=qwen3.6-27b, "
+            "proposer=deepseek-v4-pro, eval-source=skillsbench, "
+            "task-set=hot_5, validation=subset_17, patch=sentinel-blocks, "
+            "smoke-test on, max-iters=12, budget=6h/$50."
+        ),
+    )
+    p.add_argument(
+        "--task-set",
+        type=str,
+        default=None,
+        help=(
+            "Canonical task-set name (hot_5, subset_17) or path to a "
+            "task-id JSON file. Names route to the locked table; "
+            "anything else is treated as a path. Overrides --task-list "
+            "when both are provided."
+        ),
+    )
+    p.add_argument(
+        "--eval-source",
+        choices=("skillsbench", "behavioral"),
+        default=None,
+        help=(
+            "Forwarded to track_b.run. Default skillsbench (preserves "
+            "the existing path). ``behavioral`` requires --eval-set."
+        ),
+    )
+    p.add_argument(
+        "--eval-set",
+        type=Path,
+        default=None,
+        help="Forwarded to track_b.run (daycare-format eval_set.jsonl).",
+    )
+    p.add_argument(
+        "--judge-model",
+        type=str,
+        default=None,
+        help="Forwarded to track_b.run (OpenRouter slug for behavioral judge).",
+    )
+    p.add_argument(
+        "--validation-task-list",
+        type=Path,
+        default=None,
+        help=(
+            "Forwarded to track_b.run. Held-out task list scored on "
+            "each accepted winner; recorded as validation_score."
+        ),
+    )
+    p.add_argument(
+        "--patch-format",
+        choices=("json-ops", "sentinel-blocks"),
+        default=None,
+        help="Forwarded to track_b.run (default json-ops; --canonical → sentinel-blocks).",
+    )
+    p.add_argument(
+        "--max-iters",
+        type=int,
+        default=None,
+        help="Forwarded to track_b.run --num-generations (alias).",
+    )
+    p.add_argument(
+        "--budget-hours",
+        type=float,
+        default=None,
+        help="Wall-clock cap (hours); maps to --max-wall-min in track_b.run.",
+    )
+    p.add_argument(
+        "--budget-usd",
+        type=float,
+        default=None,
+        help="Aliases --max-budget-usd for clarity in the canonical preset.",
+    )
+    p.add_argument(
+        "--smoke-test",
+        dest="smoke_test",
+        action="store_true",
+        default=None,
+        help="Forward --smoke-test to track_b.run (default in --canonical).",
+    )
+    p.add_argument(
+        "--no-smoke-test",
+        dest="smoke_test",
+        action="store_false",
+        help="Forward --no-smoke-test to track_b.run.",
+    )
+    # kai-skills patch (Group F, 2026-05-28): forward the bounded
+    # edit-budget L_t schedule to track_b.run. Default is None here (not
+    # ``cosine:8->2``) so ``_apply_canonical_defaults`` can detect a
+    # user-supplied override. The track_b.run side defaults to
+    # ``cosine:8->2`` directly when this wrapper omits the flag.
+    p.add_argument(
+        "--edit-budget",
+        type=str,
+        default=None,
+        help=(
+            "Forward --edit-budget L_t scheduler to track_b.run. Spec: "
+            "``constant:N``, ``linear:N->M``, ``cosine:N->M``. "
+            "``--canonical`` injects ``cosine:8->2``."
+        ),
+    )
+    # kai-skills patch (Group E, 2026-05-28): forward the strict-gate +
+    # rejected-buffer flags to track_b.run. Defaults are ``None`` so the
+    # canonical preset can detect a user-supplied override; track_b.run
+    # carries its own defaults when this wrapper omits the flag.
+    p.add_argument(
+        "--validation-gate",
+        choices=("strict", "record", "relaxed"),
+        default=None,
+        help=(
+            "Forward --validation-gate to track_b.run. ``--canonical`` "
+            "injects ``strict``."
+        ),
+    )
+    p.add_argument(
+        "--rejected-buffer-size",
+        type=int,
+        default=None,
+        help="Forward --rejected-buffer-size to track_b.run (default 10).",
+    )
+    p.add_argument(
+        "--max-proposer-prompt-tokens",
+        type=int,
+        default=None,
+        help=("Forward --max-proposer-prompt-tokens to track_b.run (default 90000)."),
+    )
+    # kai-skills patch (Group H, 2026-05-28): forward partition-reflection
+    # flags. Defaults are ``None`` so the canonical preset can detect a
+    # user-supplied override (per H.6 back-compat note: user-passed
+    # ``--reflection-mode single`` must survive --canonical).
+    p.add_argument(
+        "--reflection-mode",
+        choices=("single", "partition"),
+        default=None,
+        help=(
+            "Forward --reflection-mode to track_b.run. ``--canonical`` "
+            "injects ``partition`` (paper default)."
+        ),
+    )
+    p.add_argument(
+        "--reflection-batch-size",
+        type=int,
+        default=None,
+        help=("Forward --reflection-batch-size to track_b.run (default 8)."),
+    )
+    p.add_argument(
+        "--reflection-success-threshold",
+        type=float,
+        default=None,
+        help=("Forward --reflection-success-threshold to track_b.run (default 0.5)."),
+    )
+    # kai-skills patch (Group G, 2026-05-28; plan §7l + §7n): forward
+    # slow-update consolidator + meta-skill audit log flags. Defaults
+    # are ``None`` so the canonical preset can detect a user-supplied
+    # override; track_b.run carries its own defaults when this wrapper
+    # omits the flag. G is the LAST second-pass group to append in
+    # §7n's Round 2 order.
+    p.add_argument(
+        "--slow-update-every",
+        type=int,
+        default=None,
+        help=(
+            "Forward --slow-update-every K to track_b.run (default 4). "
+            "Consolidator fires every K iters."
+        ),
+    )
+    p.add_argument(
+        "--meta-skill-path",
+        type=Path,
+        default=None,
+        help="Forward --meta-skill-path to track_b.run.",
+    )
+    p.add_argument(
+        "--consolidator-model",
+        type=str,
+        default=None,
+        help=(
+            "Forward --consolidator-model to track_b.run. Default: mirror "
+            "--outer-model."
+        ),
+    )
+    p.add_argument(
+        "--meta-skill-max-iters",
+        type=int,
+        default=None,
+        help="Forward --meta-skill-max-iters to track_b.run (default 20).",
+    )
+    p.add_argument(
+        "--persistent-failure-window",
+        type=int,
+        default=None,
+        help=("Forward --persistent-failure-window to track_b.run (default 3)."),
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the resolved track_b.run argv + cost estimate without dispatching",
@@ -203,18 +442,16 @@ def _install_wallclock_watchdog(seconds: int) -> None:
     logger.info("wallclock watchdog armed: %ds", seconds)
 
 
-def _ensure_api_key(*, force_synthetic: bool = False) -> Optional[str]:
-    """Return None when both required keys are set; else an error message.
+def _ensure_api_key(
+    *, force_synthetic: bool = False, agent: str = "claude-code"
+) -> Optional[str]:
+    """Return None when required keys are set; else an error message.
 
-    Two distinct keys gate live runs:
-      * ``ANTHROPIC_API_KEY`` — the inner ``claude-code`` agent driven
-        by ``bench eval create`` calls Anthropic directly.
-      * ``OPENROUTER_API_KEY`` — the OUTER patch-generating LLM
-        (``OpenRouterLLM``) calls OpenRouter for the configured slug
-        (e.g. ``moonshotai/kimi-k2.6``). Bug 15: previously unchecked,
-        which silently fell through to ``SyntheticLLM`` (random
-        mutations). The runner would burn its full inner-trial budget
-        for nothing.
+    Required keys depend on the agent harness:
+      * ``claude-code``: needs ``ANTHROPIC_API_KEY`` (inner) +
+        ``OPENROUTER_API_KEY`` (outer mutator).
+      * ``gemini``: needs ``GEMINI_API_KEY`` or ``GOOGLE_API_KEY`` (inner) +
+        ``OPENROUTER_API_KEY`` (outer mutator). Escapes Anthropic 20MB/hr cap.
 
     ``--force-synthetic`` skips both checks (synthetic mode bypasses
     every API call by design).
@@ -222,8 +459,12 @@ def _ensure_api_key(*, force_synthetic: bool = False) -> Optional[str]:
     if force_synthetic:
         return None
     missing = []
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        missing.append("ANTHROPIC_API_KEY (inner claude-code agent)")
+    if agent == "claude-code":
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            missing.append("ANTHROPIC_API_KEY (inner claude-code agent)")
+    elif agent == "gemini":
+        if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+            missing.append("GEMINI_API_KEY or GOOGLE_API_KEY (inner gemini agent)")
     if not os.environ.get("OPENROUTER_API_KEY"):
         missing.append("OPENROUTER_API_KEY (outer patch LLM)")
     if not missing:
@@ -298,11 +539,90 @@ def _estimate_cost(args: argparse.Namespace, n_tasks: int) -> float:
     return trials * _COST_PER_TRIAL_USD
 
 
+def _apply_canonical_defaults(args: argparse.Namespace) -> None:
+    """Inject the consolidated v0 config when ``--canonical`` is set.
+
+    Plan section 4 (Group B.8) canonical args (only fill what the user
+    didn't override on the CLI — argparse defaults are detectable via
+    ``None`` sentinels on the new options).
+    """
+    if not getattr(args, "canonical", False):
+        return
+    if args.inner_model in (None, "claude-haiku-4-5"):
+        # Override unless the user picked something else explicitly. The
+        # parser's literal default is "claude-haiku-4-5"; we can't tell
+        # whether the user set it intentionally, so we only swap when
+        # the canonical preset wants a different value.
+        args.inner_model = "qwen/qwen3.6-27b"
+    if args.outer_model is None:
+        args.outer_model = "deepseek/deepseek-v4-pro"
+    if args.eval_source is None:
+        args.eval_source = "skillsbench"
+    if args.task_set is None:
+        args.task_set = "hot_5"
+    if args.validation_task_list is None:
+        args.validation_task_list = _CANONICAL_SUBSET_17
+    if args.patch_format is None:
+        args.patch_format = "sentinel-blocks"
+    if args.smoke_test is None:
+        args.smoke_test = True
+    if args.max_iters is None:
+        args.max_iters = 12
+    if args.budget_hours is None:
+        args.budget_hours = 6.0
+    if args.budget_usd is None:
+        args.budget_usd = 50.0
+    # kai-skills patch (Group F, 2026-05-28): canonical preset injects
+    # the paper-default cosine taper from 8 down to 2 ops per iter.
+    # F is FIRST in the §7n append order; E/G/H append their canonical
+    # defaults AFTER this block.
+    if args.edit_budget is None:
+        args.edit_budget = "cosine:8->2"
+    # kai-skills patch (Group E, 2026-05-28): canonical preset enables
+    # the strict validation gate + 10-entry rejected ring + 90k-token
+    # proposer prompt cap (per plan §4b context budget). E appends
+    # AFTER F per §7n's Round 1 append order.
+    if args.validation_gate is None:
+        args.validation_gate = "strict"
+    if args.rejected_buffer_size is None:
+        args.rejected_buffer_size = 10
+    if args.max_proposer_prompt_tokens is None:
+        args.max_proposer_prompt_tokens = 90000
+    # kai-skills patch (Group H, 2026-05-28): canonical preset enables
+    # success/failure minibatch partition reflection per plan section 7m.
+    # H is SECOND in §7n Round 2 append order — these lines go AFTER E's
+    # block and BEFORE G's (G rebases later). Per H.6: respect explicit
+    # user override (only fill when the user hasn't pinned it).
+    if args.reflection_mode is None:
+        args.reflection_mode = "partition"
+    if args.reflection_batch_size is None:
+        args.reflection_batch_size = 8
+    if args.reflection_success_threshold is None:
+        args.reflection_success_threshold = 0.5
+    # kai-skills patch (Group G, 2026-05-28; plan §7l + §7n): canonical
+    # preset enables the slow-update consolidator + meta-skill audit log
+    # at paper defaults — fire every 4 iters, bound the log to 20 tail
+    # entries, count a task as "persistent failure" after 3 consecutive
+    # failed iters. G appends LAST in §7n's Round 2 append order (H
+    # first; G rebases after).
+    if getattr(args, "slow_update_every", None) is None:
+        args.slow_update_every = 4
+    if getattr(args, "meta_skill_max_iters", None) is None:
+        args.meta_skill_max_iters = 20
+    if getattr(args, "persistent_failure_window", None) is None:
+        args.persistent_failure_window = 3
+
+
 def _build_track_b_argv(
     args: argparse.Namespace,
     task_list: Path,
 ) -> List[str]:
     """Construct the equivalent ``python -m skill_evolve.track_b.run`` argv."""
+    # Honor --max-iters as an alias for --num-generations under
+    # --canonical (or whenever the user passes it explicitly).
+    num_generations = (
+        args.max_iters if args.max_iters is not None else args.num_generations
+    )
     argv: List[str] = [
         "--task-source",
         "skillsbench",
@@ -312,7 +632,7 @@ def _build_track_b_argv(
         "--task-list",
         str(task_list),
         "--num-generations",
-        str(args.num_generations),
+        str(num_generations),
         "--num-islands",
         str(args.num_islands),
         "--repeats",
@@ -332,9 +652,70 @@ def _build_track_b_argv(
     # claude-haiku-4-5 here, never None). Belt-and-suspenders for
     # Bug 12's track_b-side requirement.
     argv.extend(["--inner-model", args.inner_model])
+    argv.extend(["--agent", args.agent])
     # Bug 15: propagate synthetic mode end-to-end.
     if getattr(args, "force_synthetic", False):
         argv.append("--force-synthetic")
+    # kai-skills patch (Group B, 2026-05-27): forward eval-source flags.
+    if args.eval_source:
+        argv.extend(["--eval-source", args.eval_source])
+    if args.eval_set:
+        argv.extend(["--eval-set", str(args.eval_set)])
+    if args.judge_model:
+        argv.extend(["--judge-model", args.judge_model])
+    if args.validation_task_list is not None:
+        argv.extend(["--validation-task-list", str(args.validation_task_list)])
+    # kai-skills patch (Group F, 2026-05-28): forward --edit-budget to
+    # track_b.run when the user (or --canonical) supplied a value. Omitting
+    # the flag lets track_b.run apply its own default (``cosine:8->2``).
+    if args.edit_budget is not None:
+        argv.extend(["--edit-budget", args.edit_budget])
+    # kai-skills patch (Group E, 2026-05-28): forward strict-gate +
+    # rejected-buffer flags. ``None`` means "let track_b.run pick its own
+    # default" (preserves back-compat for non-canonical invocations).
+    if args.validation_gate is not None:
+        argv.extend(["--validation-gate", args.validation_gate])
+    if args.rejected_buffer_size is not None:
+        argv.extend(["--rejected-buffer-size", str(args.rejected_buffer_size)])
+    if args.max_proposer_prompt_tokens is not None:
+        argv.extend(
+            [
+                "--max-proposer-prompt-tokens",
+                str(args.max_proposer_prompt_tokens),
+            ]
+        )
+    # kai-skills patch (Group H, 2026-05-28): forward partition-reflection
+    # flags. ``None`` means "let track_b.run pick its own default"
+    # (preserves back-compat for non-canonical invocations).
+    if args.reflection_mode is not None:
+        argv.extend(["--reflection-mode", args.reflection_mode])
+    if args.reflection_batch_size is not None:
+        argv.extend(["--reflection-batch-size", str(args.reflection_batch_size)])
+    if args.reflection_success_threshold is not None:
+        argv.extend(
+            [
+                "--reflection-success-threshold",
+                str(args.reflection_success_threshold),
+            ]
+        )
+    # kai-skills patch (Group G, 2026-05-28; plan §7l + §7n): forward
+    # slow-update consolidator + meta-skill flags. ``None`` lets
+    # track_b.run apply its own defaults.
+    if getattr(args, "slow_update_every", None) is not None:
+        argv.extend(["--slow-update-every", str(args.slow_update_every)])
+    if getattr(args, "meta_skill_path", None) is not None:
+        argv.extend(["--meta-skill-path", str(args.meta_skill_path)])
+    if getattr(args, "consolidator_model", None) is not None:
+        argv.extend(["--consolidator-model", args.consolidator_model])
+    if getattr(args, "meta_skill_max_iters", None) is not None:
+        argv.extend(["--meta-skill-max-iters", str(args.meta_skill_max_iters)])
+    if getattr(args, "persistent_failure_window", None) is not None:
+        argv.extend(
+            [
+                "--persistent-failure-window",
+                str(args.persistent_failure_window),
+            ]
+        )
     if args.verbose:
         argv.append("--verbose")
     return argv
@@ -347,7 +728,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    err = _ensure_api_key(force_synthetic=args.force_synthetic)
+    # kai-skills patch (Group B, 2026-05-27): inject the canonical preset
+    # BEFORE any other resolution so --task-set / --validation-task-list /
+    # budget caps pick up the defaults.
+    _apply_canonical_defaults(args)
+    # Resolve --task-set name → path; overrides --task-list when set.
+    if args.task_set is not None:
+        resolved = _resolve_task_set(args.task_set)
+        if resolved is not None:
+            args.task_list = resolved
+    # Resolve --validation-task-list canonical names too (so users can
+    # pass --validation-task-list subset_17 directly).
+    if args.validation_task_list is not None:
+        s_name = str(args.validation_task_list)
+        if s_name in _TASK_SET_RESOLUTION:
+            args.validation_task_list = _TASK_SET_RESOLUTION[s_name]
+    # Map --budget-hours onto --max-wall-min when explicitly set.
+    if args.budget_hours is not None:
+        args.max_wall_min = int(round(args.budget_hours * 60))
+    if args.budget_usd is not None:
+        args.max_budget_usd = float(args.budget_usd)
+
+    err = _ensure_api_key(force_synthetic=args.force_synthetic, agent=args.agent)
     if err:
         print(f"ERROR: {err}", file=sys.stderr)
         return _EXIT_NO_API_KEY

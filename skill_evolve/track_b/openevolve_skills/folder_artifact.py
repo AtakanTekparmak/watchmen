@@ -281,11 +281,34 @@ class FolderArtifact:
 
     # -------------------- filesystem I/O --------------------
 
-    def write_to(self, target: Path) -> Path:
-        """Write all files under ``target``. Creates parent dirs."""
+    def write_to(self, target: Path, *, deployment: bool = False) -> Path:
+        """Write all files under ``target``. Creates parent dirs.
+
+        Args:
+            target: destination directory (created if missing).
+            deployment: kai-skills patch (Group G, 2026-05-28; plan §7l).
+                When True, training-only files are stripped from the
+                output: ``meta_skill.md`` at the bundle root and
+                ``__pycache__/`` entries anywhere in the tree. Used by
+                bundle-promotion / validation-eval sites that must not
+                leak training-side bookkeeping into the deployed bundle.
+                Default False to preserve back-compat behavior for the
+                evolution-loop sites that need meta_skill.md to
+                propagate across iterations.
+        """
         target = Path(target)
         target.mkdir(parents=True, exist_ok=True)
         for relpath, content in self.files.items():
+            if deployment:
+                # Strip the bundle-root meta_skill.md (paper §7l: never
+                # deployed) and any __pycache__ entries that survived
+                # the in-memory dict.
+                if relpath == "meta_skill.md":
+                    continue
+                if "__pycache__" in relpath.split("/"):
+                    continue
+                if Path(relpath).name.startswith("._"):
+                    continue
             dst = target / relpath
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_text(content, encoding="utf-8")

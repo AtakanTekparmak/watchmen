@@ -192,6 +192,17 @@ class SkillFolderEvaluator:
         # ``BenchCliBackend.run_task(agent=...)``. Ignored by the hermes
         # backend.
         agent: str = "claude-code",
+        # kai-skills patch (Group B, 2026-05-27): --eval-source + held-out
+        # validation. ``eval_source="skillsbench"`` (default) preserves
+        # the existing flow. ``eval_source="behavioral"`` dispatches via
+        # ``skill_evolve.evaluator.evaluate(..., eval_source="behavioral",
+        # eval_set_path=..., judge_model=...)``. ``validation_task_list``
+        # is a path to a held-out task list scored separately on accepted
+        # winners (recorded as ``validation_score``; no re-acceptance).
+        eval_source: str = "skillsbench",
+        eval_set_path: Optional["Path"] = None,
+        judge_model: Optional[str] = None,
+        validation_task_list: Optional["Path"] = None,
     ) -> None:
         self.force_synthetic = force_synthetic
         self.verify = verify
@@ -209,6 +220,11 @@ class SkillFolderEvaluator:
         self.leak_policy = leak_policy
         # Phase E v7 patch (2026-05-05)
         self.agent = agent
+        # kai-skills patch (Group B, 2026-05-27)
+        self.eval_source = eval_source
+        self.eval_set_path = eval_set_path
+        self.judge_model = judge_model
+        self.validation_task_list = validation_task_list
         # The Controller fills these once it has the resolved task
         # records. ``anonymizer`` is the dispatched module (in-file for
         # tblite, ``skillsbench_anonymize`` for skillsbench) and
@@ -281,7 +297,11 @@ class SkillFolderEvaluator:
 
         with tempfile.TemporaryDirectory(prefix="track_b_eval_") as tmp:
             skills_dir = Path(tmp) / "skills"
-            artifact.write_to(skills_dir)
+            # kai-skills patch (Group G, 2026-05-28; plan §7l): the
+            # evaluator materializes the bundle for the inner agent —
+            # ``meta_skill.md`` is training-only and MUST NOT leak into
+            # the deployed bundle the agent sees.
+            artifact.write_to(skills_dir, deployment=True)
             res = _skill_evaluator.evaluate(
                 skills_dir,
                 cascade=self.cascade,
@@ -294,9 +314,83 @@ class SkillFolderEvaluator:
                 task_ids=task_ids_arg,
                 agent_backend=self.agent_backend,
                 agent=self.agent,
+                # kai-skills patch (Group B, 2026-05-27)
+                eval_source=self.eval_source,
+                eval_set_path=self.eval_set_path,
+                judge_model=self.judge_model,
             )
         translated = self._translate(res, artifact, program_id=program_id)
         return self._apply_leak_policy(translated, artifact)
+
+    # kai-skills patch (Group B, 2026-05-27): held-out validation eval.
+    # Mirrors ``evaluate_artifact`` but overrides the task_list with the
+    # ``--validation-task-list`` path. Returns just the composite/mean_score
+    # pair so callers can stamp them onto an artifact / run record without
+    # having to re-translate the full EvaluationResult shape.
+    def evaluate_validation(
+        self,
+        artifact: FolderArtifact,
+        *,
+        program_id: str = "",
+    ) -> Dict[str, float]:
+        """Score ``artifact`` against the held-out validation task list.
+
+        Returns ``{}`` when ``validation_task_list`` is unset. Otherwise
+        returns ``{"validation_composite": float, "validation_mean_score":
+        float | None, "validation_success_rate": float, "validation_n":
+        int}`` so the controller can record them on the artifact without
+        re-translating the EvaluationResult.
+        """
+        if self.validation_task_list is None:
+            return {}
+        artifact.validate()
+        val_path = Path(self.validation_task_list)
+        task_ids_arg: Optional[List[str]] = None
+        if val_path.exists():
+            try:
+                loaded_ids = json.loads(val_path.read_text(encoding="utf-8"))
+                if isinstance(loaded_ids, list):
+                    task_ids_arg = [str(t) for t in loaded_ids]
+            except Exception:
+                logger.warning(
+                    "evaluate_validation: failed to read %s; skipping",
+                    val_path,
+                )
+                return {}
+        sources_arg: Optional[List[str]] = None
+        if self.task_source == "skillsbench":
+            sources_arg = ["skillsbench"]
+        elif self.task_source == "tblite":
+            sources_arg = ["tblite"]
+        with tempfile.TemporaryDirectory(prefix="track_b_val_") as tmp:
+            skills_dir = Path(tmp) / "skills"
+            # kai-skills patch (Group G, 2026-05-28; plan §7l): validation
+            # eval uses the deployment-shape bundle — strip ``meta_skill.md``.
+            artifact.write_to(skills_dir, deployment=True)
+            res = _skill_evaluator.evaluate(
+                skills_dir,
+                cascade=self.cascade,
+                max_workers=self.max_workers,
+                model=self.model,
+                force_synthetic=self.force_synthetic,
+                verify=self.verify,
+                repeats=self.repeats,
+                sources=sources_arg,
+                task_ids=task_ids_arg,
+                agent_backend=self.agent_backend,
+                agent=self.agent,
+                eval_source=self.eval_source,
+                eval_set_path=self.eval_set_path,
+                judge_model=self.judge_model,
+            )
+        return {
+            "validation_composite": float(res.composite),
+            "validation_mean_score": (
+                float(res.mean_score) if res.mean_score is not None else None
+            ),
+            "validation_success_rate": float(res.success_rate),
+            "validation_n": int(res.n_tasks),
+        }
 
     def _apply_leak_policy(
         self,

@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from .folder import SkillDoc, SkillFolder, make_skill_doc
+from .folder import SkillFolder, make_skill_doc
 from .llm import LLMClient
 from .prompts import (
     AUTHOR_B_SYSTEM,
@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Op records (for logging / testability)
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class OpRecord:
@@ -82,7 +83,7 @@ def _parse_json_object(text: str) -> Optional[Dict[str, Any]]:
     end = s.rfind("}")
     if start != -1 and end > start:
         try:
-            return json.loads(s[start:end + 1])
+            return json.loads(s[start : end + 1])
         except json.JSONDecodeError:
             return None
     return None
@@ -91,6 +92,7 @@ def _parse_json_object(text: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Individual operators
 # ---------------------------------------------------------------------------
+
 
 def apply_add_skill(
     folder: SkillFolder,
@@ -119,7 +121,9 @@ def apply_add_skill(
     return out
 
 
-def apply_remove_skill(folder: SkillFolder, client: LLMClient, *, name: str) -> SkillFolder:
+def apply_remove_skill(
+    folder: SkillFolder, client: LLMClient, *, name: str
+) -> SkillFolder:
     out = folder.clone()
     if not out.remove(name):
         raise KeyError(f"RemoveSkill: '{name}' not in folder")
@@ -161,8 +165,10 @@ def apply_split_skill(
             frontmatter=json.dumps(src.frontmatter, indent=2),
             body=src.body,
             rationale=rationale,
-            name_a=name_a, desc_a=desc_a,
-            name_b=name_b, desc_b=desc_b,
+            name_a=name_a,
+            desc_a=desc_a,
+            name_b=name_b,
+            desc_b=desc_b,
         ),
         tag="split",
     )
@@ -243,11 +249,9 @@ def _validate_script_path(path: str) -> str:
         raise ValueError(
             f"script path must start with 'scripts/' and name a file, got {path!r}"
         )
-    suffix = path[path.rfind("."):] if "." in parts[-1] else ""
+    suffix = path[path.rfind(".") :] if "." in parts[-1] else ""
     if suffix not in _SCRIPT_EXT_SHEBANG:
-        raise ValueError(
-            f"script path must end in .sh or .py, got {path!r}"
-        )
+        raise ValueError(f"script path must end in .sh or .py, got {path!r}")
     return path
 
 
@@ -260,7 +264,7 @@ def _ensure_shebang(path: str, content: str) -> str:
     """
     if content.startswith("#!"):
         return content
-    suffix = path[path.rfind("."):]
+    suffix = path[path.rfind(".") :]
     header = _SCRIPT_EXT_SHEBANG.get(suffix, "")
     return header + content if header else content
 
@@ -318,9 +322,7 @@ def apply_rewrite_script(
         raise KeyError(f"RewriteScript: skill '{skill}' not in folder")
     _validate_script_path(path)
     if path not in doc.auxiliary_files:
-        raise KeyError(
-            f"RewriteScript: '{path}' not in skill '{skill}'"
-        )
+        raise KeyError(f"RewriteScript: '{path}' not in skill '{skill}'")
     current = doc.auxiliary_files[path]
     raw = client.complete(
         AUTHOR_SCRIPT_SYSTEM,
@@ -354,11 +356,120 @@ def apply_remove_script(
         raise KeyError(f"RemoveScript: skill '{skill}' not in folder")
     _validate_script_path(path)
     if path not in doc.auxiliary_files:
-        raise KeyError(
-            f"RemoveScript: '{path}' not in skill '{skill}'"
-        )
+        raise KeyError(f"RemoveScript: '{path}' not in skill '{skill}'")
     del doc.auxiliary_files[path]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Sentinel-block file ops (Phase E port from daycare, 2026-05-27)
+# ---------------------------------------------------------------------------
+#
+# These ops are emitted by the sentinel-block proposer prompt and applied
+# via ``skill_evolve.shared.bundle_ops.apply_file_ops``. Each op takes a
+# parent bundle dir + a candidate dir; the underlying helper handles the
+# copytree + per-op write/delete semantics so track_a doesn't re-implement
+# them. The folder.SkillFolder model is materialized on disk first
+# (write()), the file-op runs against the dir, then SkillFolder.load()
+# refreshes the in-memory state if the caller wants to chain further ops.
+
+
+def _apply_single_file_op(
+    folder: SkillFolder,
+    *,
+    op_kind: str,
+    path: str,
+    content: str | None = None,
+    files: dict[str, str] | None = None,
+) -> SkillFolder:
+    """Materialize ``folder`` to a tmp dir, apply one file op via shared
+    bundle_ops, reload as a fresh SkillFolder. Used by AddFileOp /
+    EditFileOp / DeleteFileOp / RewriteFolderOp dispatchers.
+    """
+    import tempfile
+
+    from skill_evolve.shared.bundle_ops import apply_file_ops
+    from skill_evolve.shared.patch_parser import (
+        AddFile,
+        DeleteFile,
+        EditFile,
+        RewriteFolder,
+    )
+
+    op_obj: object
+    if op_kind == "ADD_FILE":
+        op_obj = AddFile(op="ADD_FILE", path=path, content=content)
+    elif op_kind == "EDIT_FILE":
+        op_obj = EditFile(op="EDIT_FILE", path=path, content=content)
+    elif op_kind == "DELETE_FILE":
+        op_obj = DeleteFile(op="DELETE_FILE", path=path)
+    elif op_kind == "REWRITE_FOLDER":
+        op_obj = RewriteFolder(op="REWRITE_FOLDER", path=path, files=files)
+    else:
+        raise ValueError(f"unknown op_kind: {op_kind}")
+
+    with tempfile.TemporaryDirectory(prefix="track_a_file_op_") as tmp:
+        from pathlib import Path as _P
+
+        tmp_dir = _P(tmp)
+        parent_dir = tmp_dir / "parent"
+        candidate_dir = tmp_dir / "candidate"
+        # SkillFolder.write() refuses to overwrite without rmtree, but we
+        # use a fresh path so this is fine.
+        folder.write(parent_dir)
+        apply_file_ops(parent_dir, [op_obj], candidate_dir)  # type: ignore[arg-type]
+        return SkillFolder.load(candidate_dir)
+
+
+def apply_add_file_op(
+    folder: SkillFolder,
+    client: LLMClient,
+    *,
+    path: str,
+    content: str,
+) -> SkillFolder:
+    """ADD_FILE — write a new file at ``path`` inside the bundle."""
+    _ = client  # unused — file ops are deterministic, no LLM call
+    return _apply_single_file_op(folder, op_kind="ADD_FILE", path=path, content=content)
+
+
+def apply_edit_file_op(
+    folder: SkillFolder,
+    client: LLMClient,
+    *,
+    path: str,
+    content: str,
+) -> SkillFolder:
+    """EDIT_FILE — overwrite an existing file at ``path``."""
+    _ = client
+    return _apply_single_file_op(
+        folder, op_kind="EDIT_FILE", path=path, content=content
+    )
+
+
+def apply_delete_file_op(
+    folder: SkillFolder,
+    client: LLMClient,
+    *,
+    path: str,
+) -> SkillFolder:
+    """DELETE_FILE — remove a file at ``path``."""
+    _ = client
+    return _apply_single_file_op(folder, op_kind="DELETE_FILE", path=path)
+
+
+def apply_rewrite_folder_op(
+    folder: SkillFolder,
+    client: LLMClient,
+    *,
+    path: str,
+    files: dict[str, str],
+) -> SkillFolder:
+    """REWRITE_FOLDER — replace contents of folder at ``path``."""
+    _ = client
+    return _apply_single_file_op(
+        folder, op_kind="REWRITE_FOLDER", path=path, files=files
+    )
 
 
 def apply_rewrite_content(
@@ -392,6 +503,7 @@ def apply_rewrite_content(
 # Pick-op planner
 # ---------------------------------------------------------------------------
 
+
 def pick_op(
     folder: SkillFolder,
     critique: str,
@@ -423,7 +535,9 @@ def pick_op(
     return _fallback_op(folder, last_failures)
 
 
-def _coerce_op_record(parsed: Optional[Dict[str, Any]], folder: SkillFolder) -> Optional[OpRecord]:
+def _coerce_op_record(
+    parsed: Optional[Dict[str, Any]], folder: SkillFolder
+) -> Optional[OpRecord]:
     if not isinstance(parsed, dict):
         return None
     op = parsed.get("op")
@@ -474,7 +588,7 @@ def _coerce_op_record(parsed: Optional[Dict[str, Any]], folder: SkillFolder) -> 
                 return None
             new_names.append(n)
         # Allow one new name to reuse the old slot (split + keep one child's name).
-        free_after = (valid_names - {name})
+        free_after = valid_names - {name}
         if any(n in free_after for n in new_names):
             return None
         if len(set(new_names)) != 2:
@@ -494,8 +608,10 @@ def _coerce_op_record(parsed: Optional[Dict[str, Any]], folder: SkillFolder) -> 
         free_after = valid_names - {a, b}
         if into in free_after:
             return None
-        return OpRecord(op, {"a": a, "b": b, "into": into,
-                             "description": desc, "rationale": rationale})
+        return OpRecord(
+            op,
+            {"a": a, "b": b, "into": into, "description": desc, "rationale": rationale},
+        )
 
     if op == "RewriteSkillContent":
         name = parsed.get("name")
@@ -537,9 +653,7 @@ def _coerce_op_record(parsed: Optional[Dict[str, Any]], folder: SkillFolder) -> 
         doc = folder.by_name(skill)
         if doc is None or path not in doc.auxiliary_files:
             return None
-        return OpRecord(
-            op, {"skill": skill, "path": path, "critique_excerpt": excerpt}
-        )
+        return OpRecord(op, {"skill": skill, "path": path, "critique_excerpt": excerpt})
 
     if op == "RemoveScript":
         skill = parsed.get("skill")
@@ -588,6 +702,7 @@ def _fallback_op(
 # Dispatcher
 # ---------------------------------------------------------------------------
 
+
 def apply_op(
     folder: SkillFolder,
     op: OpRecord,
@@ -601,8 +716,10 @@ def apply_op(
     a = op.args
     if name == "AddSkill":
         return apply_add_skill(
-            folder, client,
-            name=a["name"], description=a.get("description", ""),
+            folder,
+            client,
+            name=a["name"],
+            description=a.get("description", ""),
             seed=a.get("seed", ""),
         )
     if name == "RemoveSkill":
@@ -611,39 +728,60 @@ def apply_op(
         return apply_rename_skill(folder, client, old=a["old"], new=a["new"])
     if name == "SplitSkill":
         return apply_split_skill(
-            folder, client,
-            name=a["name"], into=a["into"],
+            folder,
+            client,
+            name=a["name"],
+            into=a["into"],
             rationale=a.get("rationale", ""),
         )
     if name == "MergeSkills":
         return apply_merge_skills(
-            folder, client,
-            a=a["a"], b=a["b"], into=a["into"],
+            folder,
+            client,
+            a=a["a"],
+            b=a["b"],
+            into=a["into"],
             description=a.get("description", ""),
             rationale=a.get("rationale", ""),
         )
     if name == "RewriteSkillContent":
         return apply_rewrite_content(
-            folder, client,
+            folder,
+            client,
             name=a["name"],
             critique=critique or a.get("critique_excerpt", ""),
             skill_failures=skill_failures,
         )
     if name == "AddScript":
         return apply_add_script(
-            folder, client,
-            skill=a["skill"], path=a["path"],
+            folder,
+            client,
+            skill=a["skill"],
+            path=a["path"],
             purpose=a.get("purpose", ""),
         )
     if name == "RewriteScript":
         return apply_rewrite_script(
-            folder, client,
-            skill=a["skill"], path=a["path"],
+            folder,
+            client,
+            skill=a["skill"],
+            path=a["path"],
             critique=critique or a.get("critique_excerpt", ""),
         )
     if name == "RemoveScript":
         return apply_remove_script(
-            folder, client,
-            skill=a["skill"], path=a["path"],
+            folder,
+            client,
+            skill=a["skill"],
+            path=a["path"],
         )
+    # Sentinel-block file ops (added 2026-05-27 — daycare port).
+    if name == "add_file":
+        return apply_add_file_op(folder, client, path=a["path"], content=a["content"])
+    if name == "edit_file":
+        return apply_edit_file_op(folder, client, path=a["path"], content=a["content"])
+    if name == "delete_file":
+        return apply_delete_file_op(folder, client, path=a["path"])
+    if name == "rewrite_folder":
+        return apply_rewrite_folder_op(folder, client, path=a["path"], files=a["files"])
     raise ValueError(f"unknown op: {name}")
