@@ -85,6 +85,22 @@ DEFAULT_ENABLED_TOOLSETS = "terminal,file,skills"
 # Cap turns per task so a runaway agent can't burn the whole budget.
 DEFAULT_MAX_TURNS = 20
 
+# Verifier-status values that signal a BROKEN HARNESS, not a real
+# verified failure. Defined here once so bench_cli and the aggregation
+# below share a single source of truth. Counted as ``errored_count`` on
+# EvalResult so an all-errored eval reads as an abort signal rather than
+# masquerading as "evolution found no improvement" (2026-05-28 silent-
+# fail incident: bench-cli died at arg-parse, every candidate scored 0.0).
+INFRA_ERROR_STATUSES = frozenset(
+    {
+        "bench_cli_error",
+        "agent_error",
+        "timeout",
+        "agent_timeout",
+        "verifier_unavailable",
+    }
+)
+
 
 def _hermes_default_model() -> Optional[str]:
     """Read ~/.hermes/config.yaml's model.default, if present.
@@ -174,6 +190,13 @@ class EvalResult:
     # verified because Docker was down" apart from "4/5 passed".
     verified_count: int = 0
     unverified_count: int = 0
+    # Per-task outcomes whose ``verifier_status`` is in
+    # ``INFRA_ERROR_STATUSES`` — i.e. a BROKEN HARNESS (bench-cli died,
+    # agent errored, timed out, verifier unavailable), not a real verified
+    # failure. The controller reads this to abort a run whose eval is all
+    # infra-errors rather than burning budget on "no improvement found"
+    # (2026-05-28 silent-fail incident).
+    errored_count: int = 0
     verifier_disabled: bool = False
     # Continuous-score mean across tasks (``None`` → none of the tasks
     # exposed a structured breakdown, so fall back to ``success_rate``).
@@ -652,6 +675,18 @@ def evaluate(
     verify: bool = True,
     repeats: int = 3,
     keep_sandbox: bool = False,
+    agent: str = "claude-code",
+    # kai-skills patch (Group B, 2026-05-27): --eval-source dispatch.
+    # ``skillsbench`` (default) preserves the existing tblite / swebench
+    # / skillsbench flow byte-identically. ``behavioral`` dispatches to
+    # ``skill_evolve.behavioral.adapter.score_bundle_behavioral`` against
+    # a daycare-format ``eval_set.jsonl`` (judge-LLM scoring; no
+    # benchmark harness). The behavioral path REQUIRES ``eval_set_path``;
+    # ``judge_model`` is required unless the adapter is given an explicit
+    # ``llm`` stub (tests).
+    eval_source: str = "skillsbench",
+    eval_set_path: Optional[Path] = None,
+    judge_model: Optional[str] = None,
 ) -> EvalResult:
     """Score a candidate skills folder.
 
@@ -696,6 +731,29 @@ def evaluate(
     if not skills_folder_path.is_dir():
         raise FileNotFoundError(skills_folder_path)
 
+    # kai-skills patch (Group B, 2026-05-27): behavioral eval-source dispatch.
+    # When the caller selects ``eval_source=behavioral`` we route the
+    # candidate through the daycare-style judge-LLM scoring path instead
+    # of the SkillsBench / tblite agent harness. ``eval_set_path`` is
+    # required because there is no implicit default. The dispatch
+    # happens BEFORE any benchmark hydration so behavioral runs do not
+    # require ``manifest.json`` to be present.
+    if eval_source == "behavioral":
+        if eval_set_path is None:
+            raise ValueError("--eval-set required when --eval-source behavioral")
+        from skill_evolve.behavioral.adapter import score_bundle_behavioral
+
+        return score_bundle_behavioral(
+            skills_folder_path,
+            eval_set_path,
+            judge_model,
+            repeats=repeats,
+        )
+    if eval_source != "skillsbench":
+        raise ValueError(
+            f"unknown eval_source: {eval_source!r} (known: 'skillsbench', 'behavioral')"
+        )
+
     if agent_backend is not None and agent_backend not in ("hermes", "bench-cli"):
         raise ValueError(
             f"unknown agent_backend: {agent_backend!r} (known: 'hermes', 'bench-cli')"
@@ -714,7 +772,11 @@ def evaluate(
             "returning synthetic placeholder",
         )
 
-    if not RUN_AGENT_PY.exists():
+    # Only the hermes backend needs run_agent.py; the bench-cli backend
+    # shells out to ``bench eval create`` and never touches it. Guarding
+    # on the resolved backend keeps a missing hermes fork from spuriously
+    # aborting bench-cli SkillsBench runs (pre-existing unconditional bug).
+    if (agent_backend or "hermes") == "hermes" and not RUN_AGENT_PY.exists():
         raise FileNotFoundError(
             f"hermes-agent run_agent.py missing at {RUN_AGENT_PY}; "
             "did you clone the fork?"
@@ -774,6 +836,7 @@ def evaluate(
                 timeout_s=int(task.get("timeout_s", 600) or 600),
                 budget_usd=0.0,
                 anonymize_map=None,
+                agent=agent,
             )
         return traj.to_task_outcome()
 
@@ -886,6 +949,12 @@ def evaluate(
 
     verified_count = sum(1 for o in outcomes if o.verified is True)
     unverified_count = sum(1 for o in outcomes if o.verified is None)
+    # Count broken-harness outcomes (bench-cli died, agent errored, timeout,
+    # verifier unavailable) so an all-errored eval is distinguishable from a
+    # genuine all-failed eval (2026-05-28 silent-fail incident).
+    errored_count = sum(
+        1 for o in outcomes if o.verifier_status in INFRA_ERROR_STATUSES
+    )
 
     return EvalResult(
         success_rate=success_rate,
@@ -898,6 +967,7 @@ def evaluate(
         cascade_truncated=cascade_truncated,
         verified_count=verified_count,
         unverified_count=unverified_count,
+        errored_count=errored_count,
         verifier_disabled=(not verify),
         mean_score=mean_score,
         scored_task_count=scored_task_count,

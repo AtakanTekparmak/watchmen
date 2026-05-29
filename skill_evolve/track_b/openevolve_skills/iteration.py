@@ -40,7 +40,7 @@ from skill_evolve.shared.rejected_buffer import RejectedBuffer, RejectedEdit
 from .database import Program, ProgramDatabase, new_program_id
 from .evaluator import SkillFolderEvaluator
 from .folder_artifact import FolderArtifactError
-from .llm_client import LLMClient, SyntheticLLM
+from .llm_client import LLMClient, ProposerAuthError, SyntheticLLM
 from .patch_parser import (
     PatchParseError,
     apply_patch,
@@ -284,8 +284,17 @@ def _run_partition_reflection(
             return ""
         try:
             return llm.generate(system=failure_system, user=base_prompt.user)
-        except Exception as exc:  # pragma: no cover — network failures
-            logger.warning("partition failure-side LLM failed: %s", exc)
+        except ProposerAuthError:
+            # kai-skills patch (2026-05-28 silent-fail hardening): a dead key
+            # must abort the run, not swallow to "" and reject to max-iters.
+            # Re-raise so the controller fails loud (HARD RULE).
+            raise
+        except Exception as exc:  # pragma: no cover — transient/network failures
+            logger.warning(
+                "partition failure-side LLM failed (%s): %s",
+                type(exc).__name__,
+                exc,
+            )
             return ""
 
     def _call_success() -> str:
@@ -293,8 +302,16 @@ def _run_partition_reflection(
             return ""
         try:
             return llm.generate(system=success_system, user=base_prompt.user)
-        except Exception as exc:  # pragma: no cover — network failures
-            logger.warning("partition success-side LLM failed: %s", exc)
+        except ProposerAuthError:
+            # kai-skills patch (2026-05-28 silent-fail hardening): re-raise so a
+            # dead key aborts rather than masquerading as an empty success side.
+            raise
+        except Exception as exc:  # pragma: no cover — transient/network failures
+            logger.warning(
+                "partition success-side LLM failed (%s): %s",
+                type(exc).__name__,
+                exc,
+            )
             return ""
 
     with _cf.ThreadPoolExecutor(max_workers=2) as pool:
@@ -1129,8 +1146,15 @@ def run_iteration(
             )
             try:
                 response = llm.generate(system=prompt.system, user=prompt.user)
-            except Exception as exc:  # pragma: no cover — network failures
-                logger.warning("LLM generate() failed: %s", exc)
+            except ProposerAuthError:
+                # kai-skills patch (2026-05-28 silent-fail hardening): a dead
+                # key must abort the run loud, not degrade to an eval_error
+                # IterationResult that rejects to max-iters (HARD RULE).
+                raise
+            except Exception as exc:  # pragma: no cover — transient/network failures
+                logger.warning(
+                    "LLM generate() failed (%s): %s", type(exc).__name__, exc
+                )
                 return IterationResult(
                     generation=generation,
                     island=island,
@@ -1210,8 +1234,13 @@ def run_iteration(
         # ``single`` (back-compat) path — original single proposer call.
         try:
             response = llm.generate(system=prompt.system, user=prompt.user)
-        except Exception as exc:  # pragma: no cover — network failures
-            logger.warning("LLM generate() failed: %s", exc)
+        except ProposerAuthError:
+            # kai-skills patch (2026-05-28 silent-fail hardening): re-raise a
+            # dead-key auth failure so the run aborts loud rather than logging
+            # a warning and rejecting to max-iters (HARD RULE).
+            raise
+        except Exception as exc:  # pragma: no cover — transient/network failures
+            logger.warning("LLM generate() failed (%s): %s", type(exc).__name__, exc)
             return IterationResult(
                 generation=generation,
                 island=island,

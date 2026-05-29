@@ -407,6 +407,20 @@ def _build_parser() -> argparse.ArgumentParser:
             "track_b.run (offline smoke mode; no Anthropic/OpenRouter calls)."
         ),
     )
+    # HARD-RULE pre-flight escape hatch. The live probe + flag-schema +
+    # routability checks run BEFORE the multi-hour loop to catch the
+    # dead-key / version-drift failure shapes that silently zeroed the
+    # 2026-05-28 smoke. --skip-preflight bypasses them (also implied by
+    # --force-synthetic / --dry-run, which never reach the live loop).
+    p.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help=(
+            "Skip the live pre-flight checks (outer-key probe, bench flag "
+            "schema, inner-model routability). Use only when you've already "
+            "validated the environment this session."
+        ),
+    )
     p.add_argument("--verbose", "-v", action="store_true")
     return p
 
@@ -475,6 +489,168 @@ def _ensure_api_key(
         + ". Phase E evolution needs both — set them in the environment "
         "or pass --force-synthetic for an offline smoke run."
     )
+
+
+class PreflightAbort(RuntimeError):
+    """Raised by the pre-flight when a hard failure is detected.
+
+    Carries the loud-and-early diagnostic for the dead-key / version-drift
+    failure shapes that silently zeroed the 2026-05-28 smoke. ``main()``
+    catches this and exits before the multi-hour loop ever starts.
+    """
+
+
+def _probe_outer_proposer_key(model: str) -> None:
+    """5-token live probe of the OUTER proposer (OpenRouter).
+
+    HARD RULE: a dead/rate-limited outer key must surface in ~$0.01 BEFORE
+    a multi-hour run, not as a wall of silent ``SyntheticLLM`` fallbacks
+    masquerading as "evolution found nothing". Reuses the same OpenRouter
+    base_url + OPENROUTER_API_KEY as ``OpenRouterLLM`` (no hand-rolled httpx).
+
+    * 401/403 -> raise PreflightAbort ("key rejected").
+    * 429     -> raise PreflightAbort ("rate-limited").
+    * network/transport error -> warn-and-continue (don't kill a run for a
+      transient DNS blip; the loop has its own retries).
+    """
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        # _ensure_api_key already reports this; nothing live to probe.
+        return
+    try:
+        from openai import OpenAI  # type: ignore
+    except ImportError:
+        logger.warning(
+            "openai SDK not importable; skipping live outer-key probe "
+            "(install openai to enable the HARD-RULE pre-flight)."
+        )
+        return
+
+    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+    try:
+        client.chat.completions.create(
+            model=model,
+            max_tokens=5,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+    except Exception as exc:  # noqa: BLE001 — classify by status, see below
+        status = getattr(exc, "status_code", None)
+        if status is None:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in (401, 403):
+            raise PreflightAbort(
+                f"outer proposer key rejected ({status}) for model "
+                f"{model!r} — aborting before the run burns budget against "
+                "a dead key (HARD RULE)."
+            ) from exc
+        if status == 429:
+            raise PreflightAbort(
+                f"outer proposer rate-limited (429) for model {model!r} — "
+                "aborting; back off or rotate the OpenRouter key before "
+                "launching."
+            ) from exc
+        # Network/transport/unknown error: warn-and-continue.
+        logger.warning(
+            "outer-key live probe hit a non-auth error (model=%s): %s. "
+            "Continuing — the evolution loop has its own retries — but the "
+            "outer key is UNVERIFIED.",
+            model,
+            exc,
+        )
+
+
+def _assert_bench_flag_schema() -> None:
+    """Assert ``bench eval create`` still accepts the long flags we emit.
+
+    Catches a recurrence of the exact regression we just fixed: benchflow
+    version drift flipping the accepted flag schema and silently zeroing
+    every candidate at arg-parse. Invokes ``bench eval create --help`` via
+    the SAME shim/argv path the backend uses, then asserts the four long
+    flags are present. Best-effort: if bench isn't importable/installed we
+    warn rather than hard-fail (the run may target a different backend).
+    """
+    try:
+        from skill_evolve.agents.bench_cli import (
+            _BENCH_SHIM_CODE,  # noqa: PLC0415 — local import keeps cold paths cheap
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "could not import bench_cli shim to verify flag schema: %s. "
+            "Skipping flag-compatibility pre-flight.",
+            exc,
+        )
+        return
+
+    argv = [sys.executable, "-c", _BENCH_SHIM_CODE, "eval", "create", "--help"]
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=120, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            "bench eval create --help did not run (%s); skipping "
+            "flag-compatibility pre-flight.",
+            exc,
+        )
+        return
+
+    help_text = (proc.stdout or "") + (proc.stderr or "")
+    required = ("--config", "--tasks-dir", "--agent", "--model")
+    missing = [flag for flag in required if flag not in help_text]
+    if missing:
+        raise PreflightAbort(
+            "bench CLI flag schema mismatch (benchflow version drift?) — "
+            f"`bench eval create --help` is missing {missing}. The backend "
+            "argv emits these long flags; a mismatch silently zeroes every "
+            "candidate at arg-parse. Aborting."
+        )
+
+
+def _check_inner_model_routability(*, agent: str, inner_model: str) -> None:
+    """Loud warning when the inner model may be unroutable via claude-code.
+
+    The qwen-via-claude-code trap: ``claude-code`` dispatches to
+    api.anthropic.com unless a provider-routing shim is wired (Layer 2).
+    A non-Anthropic inner slug with no BENCHFLOW_PROVIDER_BASE_URL set will
+    fail to route. Warning (not hard-fail) — Layer 2 owns the shim.
+    """
+    if agent != "claude-code":
+        return
+    slug = (inner_model or "").lower()
+    is_anthropic_native = slug.startswith("claude") or slug.startswith("anthropic")
+    has_routing = bool(os.environ.get("BENCHFLOW_PROVIDER_BASE_URL"))
+    if not is_anthropic_native and not has_routing:
+        logger.warning(
+            "INNER-MODEL ROUTABILITY: agent=claude-code but --inner-model=%r "
+            "is not an Anthropic-native slug and BENCHFLOW_PROVIDER_BASE_URL "
+            "is unset. claude-code dispatches to api.anthropic.com by default, "
+            "so this model is likely UNROUTABLE (the qwen-via-claude-code "
+            "trap). Set BENCHFLOW_PROVIDER_BASE_URL or wait for the Layer-2 "
+            "routing shim.",
+            inner_model,
+        )
+
+
+def _run_preflight(args: argparse.Namespace) -> None:
+    """HARD-RULE pre-flight: catch dead keys / version drift loud-and-early.
+
+    Runs BEFORE the evolution loop. Skipped under --force-synthetic /
+    --dry-run (never reach the live loop) and --skip-preflight. Raises
+    PreflightAbort on a hard failure; degrades to warnings otherwise so a
+    transient blip never kills a run for the wrong reason.
+    """
+    if args.force_synthetic or args.dry_run or args.skip_preflight:
+        return
+    # Resolve the effective outer slug the same way track_b.run does: when
+    # --outer-model is omitted the runner falls back to DEFAULT_OUTER_MODEL.
+    outer_model = args.outer_model
+    if not outer_model:
+        from skill_evolve.track_b.run import DEFAULT_OUTER_MODEL
+
+        outer_model = DEFAULT_OUTER_MODEL
+    _probe_outer_proposer_key(outer_model)
+    _assert_bench_flag_schema()
+    _check_inner_model_routability(agent=args.agent, inner_model=args.inner_model)
 
 
 def _resolve_task_list(args: argparse.Namespace) -> Optional[Path]:
@@ -752,6 +928,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     err = _ensure_api_key(force_synthetic=args.force_synthetic, agent=args.agent)
     if err:
         print(f"ERROR: {err}", file=sys.stderr)
+        return _EXIT_NO_API_KEY
+
+    # HARD-RULE pre-flight: live outer-key probe + bench flag schema +
+    # inner-model routability, run BEFORE the multi-hour loop. Catches the
+    # dead-key / version-drift failure shapes (which silently zeroed the
+    # 2026-05-28 smoke) in ~$0.01 instead of mid-run. Auto-skipped under
+    # --force-synthetic / --dry-run / --skip-preflight.
+    try:
+        _run_preflight(args)
+    except PreflightAbort as exc:
+        print(f"ERROR: pre-flight aborted: {exc}", file=sys.stderr)
         return _EXIT_NO_API_KEY
 
     # Wall-clock guard: SIGALRM-based mid-run cap. Bench CLI does not

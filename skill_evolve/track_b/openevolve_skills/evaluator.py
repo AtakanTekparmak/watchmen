@@ -459,6 +459,10 @@ class SkillFolderEvaluator:
             "n_tasks": float(res.n_tasks),
             "verified_count": float(res.verified_count),
             "unverified_count": float(res.unverified_count),
+            # Broken-harness count — the controller reads this to abort a
+            # run whose eval is all infra-errors rather than treating it as
+            # "no improvement found" (2026-05-28 silent-fail incident).
+            "errored_count": float(res.errored_count),
         }
         # Continuous-scoring signal (added 2026-04-20). ``mean_score`` is
         # ``None`` when no task exposed a structured breakdown — omit from

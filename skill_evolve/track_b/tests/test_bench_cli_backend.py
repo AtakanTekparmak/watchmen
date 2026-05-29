@@ -149,6 +149,23 @@ def _make_writer(
     return _side_effect
 
 
+@pytest.fixture(autouse=True)
+def _no_orphan_sweep():
+    """No-op the best-effort docker orphan-sweep for deterministic counts.
+
+    ``_run_task_once`` calls ``_sweep_orphaned_compose_projects`` pre- and
+    post-dispatch (each issues ``docker ps``/``rm`` via ``subprocess.run``).
+    These tests mock ``subprocess.run`` to drive only the bench-eval call, so
+    the sweep would otherwise inflate ``run_mock.call_count`` (the pre-existing
+    ``3 != 1`` failures). Patching it out isolates the eval calls.
+    """
+    with patch(
+        "skill_evolve.agents.bench_cli._sweep_orphaned_compose_projects",
+        return_value=0,
+    ):
+        yield
+
+
 def test_argv_shape(tmp_path: Path) -> None:
     """``subprocess.run`` receives the exact argv the plan specifies."""
     task = _make_task()
@@ -172,30 +189,32 @@ def test_argv_shape(tmp_path: Path) -> None:
     # deploy_skills monkey-patch is installed in the subprocess
     # interpreter before benchflow.cli.main resolves deploy_skills.
     # Argv shape:
-    #   [<python>, "-c", <shim>, "eval", "create", -f, -t, -a, -m, ...]
+    #   [<python>, "-c", <shim>, "eval", "create",
+    #    --config, --tasks-dir, --agent, --model, ...]
     assert argv[0].endswith("python") or argv[0].endswith("python3")
     assert argv[1] == "-c"
     # SG-1 shim: subprocess pre-imports register_claude_code so
-    # ``-a claude-code`` resolves against benchflow's runtime registry.
+    # ``--agent claude-code`` resolves against benchflow's runtime registry.
     assert "register_claude_code" in argv[2]
     # SG-2 shim: subprocess pre-imports the deploy_skills monkey-patch.
     assert "_benchflow_patches" in argv[2]
     assert argv[3:5] == ["eval", "create"]
-    # The flags must each appear with their expected operand right after.
-    assert "-f" in argv
-    assert "-t" in argv
-    assert "-a" in argv
-    assert "-m" in argv
-    f_idx = argv.index("-f")
-    t_idx = argv.index("-t")
-    a_idx = argv.index("-a")
-    m_idx = argv.index("-m")
-    # -f points at a YAML the backend materialized under the workdir.
+    # benchflow 0.3.4 accepts only the long flags; the short -f/-t/-a/-m forms
+    # were dropped and silently zeroed every candidate (2026-05-28 silent-fail).
+    assert "--config" in argv
+    assert "--tasks-dir" in argv
+    assert "--agent" in argv
+    assert "--model" in argv
+    f_idx = argv.index("--config")
+    t_idx = argv.index("--tasks-dir")
+    a_idx = argv.index("--agent")
+    m_idx = argv.index("--model")
+    # --config points at a YAML the backend materialized under the workdir.
     assert argv[f_idx + 1].endswith(".yaml")
     assert str(tmp_path) in argv[f_idx + 1]
-    # -t carries the real task_dir (not anonymized).
+    # --tasks-dir carries the real task_dir (not anonymized).
     assert argv[t_idx + 1] == task["success_check_payload"]["task_dir"]
-    # -a is fixed to the SG-1-registered claude-code agent; -m is the model.
+    # --agent is fixed to the SG-1-registered claude-code agent; --model is the model.
     assert argv[a_idx + 1] == "claude-code"
     assert argv[m_idx + 1] == "claude-haiku-4-5"
 
@@ -218,7 +237,7 @@ def test_yaml_jobs_dir_overridden_to_workdir(tmp_path: Path) -> None:
         )
 
     argv = run_mock.call_args.args[0]
-    yaml_path = Path(argv[argv.index("-f") + 1])
+    yaml_path = Path(argv[argv.index("--config") + 1])
     yaml_text = yaml_path.read_text(encoding="utf-8")
     expected_jobs_dir = str(tmp_path / "jobs")
     # Forced override: jobs_dir line points under the workdir,

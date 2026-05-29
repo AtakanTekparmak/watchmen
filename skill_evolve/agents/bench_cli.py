@@ -11,11 +11,13 @@ under ``<jobs_dir>/<job_name>/<trial_name>/`` (notably ``result.json``).
 
 Argv shape:
 
-    bench eval create -f <yaml> -t <task_dir> -a claude-code -m <model>
+    bench eval create --config <yaml> --tasks-dir <task_dir> \
+        --agent claude-code --model <model>
 
-The ``-f`` YAML is materialized per-task from one of the templates in
-``skill_evolve/skillsbench/scenes/`` (with-skills vs no-skills). The
-``-t`` task_dir flows from the hydrated task's success-check payload.
+The ``--config`` YAML is materialized per-task from one of the templates
+in ``skill_evolve/skillsbench/scenes/`` (with-skills vs no-skills). The
+``--tasks-dir`` task_dir flows from the hydrated task's success-check
+payload.
 
 bench's stdout is just a one-line ``Score: N/M (X%), errors=K`` summary
 — structured per-task data lives on disk:
@@ -38,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -74,6 +77,44 @@ _BENCH_SHIM_CODE = (
 )
 
 
+def _agent_env_args(model: str) -> List[str]:
+    """Thread the inner agent's required provider credentials via ``--agent-env``.
+
+    benchflow does NOT inherit the parent process's ANTHROPIC_API_KEY into
+    the agent sandbox — it fails pre-dispatch with ``agent_error |
+    ANTHROPIC_API_KEY required for model '<m>' but not set`` (surfaced by
+    the 2026-05-28 smoke once the flag fix let the call reach the agent).
+    The credentials must be passed explicitly as ``--agent-env KEY=VALUE``.
+
+    Routing:
+      * Anthropic-native slugs (``claude*`` / ``anthropic*``) → forward
+        ``ANTHROPIC_API_KEY`` (and ``ANTHROPIC_BASE_URL`` if set).
+      * Anything else → forward ``BENCHFLOW_PROVIDER_{BASE_URL,API_KEY,MODEL}``
+        when present (the provider-shim path, e.g. qwen via OpenRouter).
+
+    Values are read from ``os.environ`` at argv-build time; on the
+    ephemeral single-tenant eval VM the resulting ``ps`` exposure is
+    acceptable. Missing vars are simply omitted — the run's pre-flight
+    (skillsbench/evolve.py) is responsible for failing loud on a missing
+    inner key before the loop starts.
+    """
+    args: List[str] = []
+    m = model.lower()
+    if m.startswith("claude") or m.startswith("anthropic"):
+        forward = ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL")
+    else:
+        forward = (
+            "BENCHFLOW_PROVIDER_BASE_URL",
+            "BENCHFLOW_PROVIDER_API_KEY",
+            "BENCHFLOW_PROVIDER_MODEL",
+        )
+    for var in forward:
+        val = os.environ.get(var)
+        if val:
+            args += ["--agent-env", f"{var}={val}"]
+    return args
+
+
 def _bench_cli_argv(
     yaml_path: "Path | str",
     task_dir: str,
@@ -93,20 +134,26 @@ def _bench_cli_argv(
         ``benchflow.trial``/``benchflow.sdk`` (which import
         ``deploy_skills`` by name).
     """
+    # Long flags only: installed benchflow 0.3.4 ``bench eval create``
+    # rejects the short -f/-t/-a/-m forms at arg-parse, which silently
+    # zeroed every candidate in the 2026-05-28 smoke. Mapping verified by
+    # a live single-task repro: -f→--config, -t→--tasks-dir, -a→--agent,
+    # -m→--model.
     return [
         sys.executable,
         "-c",
         _BENCH_SHIM_CODE,
         "eval",
         "create",
-        "-f",
+        "--config",
         str(yaml_path),
-        "-t",
+        "--tasks-dir",
         str(task_dir),
-        "-a",
+        "--agent",
         agent,
-        "-m",
+        "--model",
         model,
+        *_agent_env_args(model),
     ]
 
 
@@ -129,14 +176,21 @@ def _sweep_orphaned_compose_projects(
     workers. Returns count removed. Best-effort; logs but never raises.
     """
     import subprocess as _sp
+
     try:
         # Use {{.RunningFor}} only for human-readable; rely on CreatedAt for parse.
         proc = _sp.run(
             [
-                "docker", "ps", "--filter", "name=skillsbench_",
-                "--format", "{{.ID}} {{.CreatedAt}}",
+                "docker",
+                "ps",
+                "--filter",
+                "name=skillsbench_",
+                "--format",
+                "{{.ID}} {{.CreatedAt}}",
             ],
-            capture_output=True, text=True, timeout=timeout_s,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
         )
         now = time.time()
         stale: List[str] = []
@@ -159,7 +213,8 @@ def _sweep_orphaned_compose_projects(
         _sp.run(["docker", "rm", "-f", *stale], capture_output=True, timeout=timeout_s)
         logger.warning(
             "orphan sweep: removed %d stale containers (older than %ds)",
-            len(stale), min_age_s,
+            len(stale),
+            min_age_s,
         )
         return len(stale)
     except Exception as exc:
@@ -881,7 +936,9 @@ class BenchCliBackend(AgentBackend):
         # subprocess failure), clean it up before launching a new eval.
         pre_swept = _sweep_orphaned_compose_projects()
         if pre_swept > 0:
-            _log.warning("orphan sweep (pre-dispatch): removed %d container(s)", pre_swept)
+            _log.warning(
+                "orphan sweep (pre-dispatch): removed %d container(s)", pre_swept
+            )
 
         # ``Task`` may arrive as the dataclass or its dict form; normalize.
         task_id: str = getattr(task, "task_id", None) or (
@@ -937,6 +994,15 @@ class BenchCliBackend(AgentBackend):
                     timeout=timeout_s,
                 )
             except subprocess.TimeoutExpired:
+                # Fail-loud: a broken/hung harness must be VISIBLE in the
+                # run log, not silently scored as a bad-skill failure
+                # (2026-05-28 silent-fail incident).
+                logger.warning(
+                    "bench-cli task %s failed: status=%s detail=%s",
+                    task_id,
+                    "timeout",
+                    f"timed out after {timeout_s}s",
+                )
                 return TrajectoryResult(
                     task_id=task_id,
                     success=False,
@@ -955,10 +1021,21 @@ class BenchCliBackend(AgentBackend):
             # don't accumulate zombie eval containers.
             swept = _sweep_orphaned_compose_projects()
             if swept > 0:
-                _log.warning("orphan sweep (post-dispatch): removed %d container(s)", swept)
+                _log.warning(
+                    "orphan sweep (post-dispatch): removed %d container(s)", swept
+                )
 
         if proc.returncode != 0:
             stderr = proc.stderr or ""
+            # Fail-loud: a nonzero bench-cli rc (e.g. arg-parse death) is a
+            # broken harness, not a bad skill — log it so an all-errored
+            # eval is visible in the run log (2026-05-28 silent-fail).
+            logger.warning(
+                "bench-cli task %s failed: status=%s detail=%s",
+                task_id,
+                "bench_cli_error",
+                f"rc={proc.returncode} stderr={stderr[:500]!r}",
+            )
             return TrajectoryResult(
                 task_id=task_id,
                 success=False,
@@ -985,6 +1062,16 @@ class BenchCliBackend(AgentBackend):
                 passed = stdout_summary["passed"] >= stdout_summary["total"]
                 errors = stdout_summary["errors"]
                 if errors > 0:
+                    # Fail-loud: bench reported agent-side errors with no
+                    # result.json — surface it rather than scoring a silent
+                    # zero (2026-05-28 silent-fail incident).
+                    logger.warning(
+                        "bench-cli task %s failed: status=%s detail=%s",
+                        task_id,
+                        "agent_error",
+                        f"result_json_missing; stdout_errors={errors} "
+                        f"stderr={(proc.stderr or '')[:500]!r}",
+                    )
                     return TrajectoryResult(
                         task_id=task_id,
                         success=False,
@@ -1008,6 +1095,16 @@ class BenchCliBackend(AgentBackend):
                     score=1.0 if passed else 0.0,
                     cost_usd=None,
                 )
+            # Fail-loud: no result.json and stdout score line unparseable —
+            # the harness produced nothing usable, which is a broken-harness
+            # signal, not a bad skill (2026-05-28 silent-fail incident).
+            logger.warning(
+                "bench-cli task %s failed: status=%s detail=%s",
+                task_id,
+                "bench_cli_error",
+                f"result_json_missing; stdout_unparseable "
+                f"stdout={(proc.stdout or '')[:500]!r}",
+            )
             return TrajectoryResult(
                 task_id=task_id,
                 success=False,
@@ -1025,6 +1122,14 @@ class BenchCliBackend(AgentBackend):
                 result_path.read_text(encoding="utf-8")
             )
         except (OSError, json.JSONDecodeError) as exc:
+            # Fail-loud: result.json exists but is unreadable/corrupt — a
+            # broken harness, not a bad skill (2026-05-28 silent-fail).
+            logger.warning(
+                "bench-cli task %s failed: status=%s detail=%s",
+                task_id,
+                "bench_cli_error",
+                f"result_json_unreadable path={result_path} err={exc}",
+            )
             return TrajectoryResult(
                 task_id=task_id,
                 success=False,

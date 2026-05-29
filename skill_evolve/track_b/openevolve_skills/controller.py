@@ -16,13 +16,19 @@ from typing import Any, Dict, List, Optional
 
 from skill_evolve.shared.rejected_buffer import RejectedBuffer
 
+# INFRA_ERROR_STATUSES classifies bench_cli verifier_status strings as
+# "infra error vs real verified failure". Imported (not redefined) per the
+# spine handoff contract so the broken-harness abort guards below agree with
+# the evaluator's errored_count accounting (2026-05-28 silent-fail incident).
+from skill_evolve.evaluator import INFRA_ERROR_STATUSES
+
 from .database import (
     Program,
     ProgramDatabase,
     cell_key,
     new_program_id,
 )
-from .evaluator import SkillFolderEvaluator
+from .evaluator import EvaluationResult, SkillFolderEvaluator
 from .folder_artifact import FolderArtifact
 from .islands import seed_variants
 from .iteration import GateState, IterationResult, run_iteration
@@ -30,6 +36,13 @@ from .llm_client import LLMClient
 from .prompt_sampler import PromptSampler
 
 logger = logging.getLogger(__name__)
+
+# kai-skills patch (2026-05-28 silent-fail incident): if the inner harness
+# dies mid-run (e.g. docker daemon crash, dead API key surfacing late) every
+# subsequent candidate eval comes back all-errored. Treating that as "no
+# improvement found" would grind silently to max-iters while burning proposer
+# budget. Abort after this many CONSECUTIVE all-errored candidate evals.
+CONSECUTIVE_ERROR_ABORT = 3
 
 
 @dataclass
@@ -186,6 +199,22 @@ def run_evolution(
             variant.total_bytes(),
         )
         eval_res = evaluator.evaluate_artifact(variant, program_id="")
+        # kai-skills patch (2026-05-28 silent-fail incident): a broken inner
+        # harness reports EVERY task as infra-errored (errored_count ==
+        # n_tasks) yet still returns a well-formed zero-composite result.
+        # Without this guard the loop treats that as "seed scores 0.0, keep
+        # mutating" and burns the whole proposer budget on a dead harness.
+        # Fail loud at the FIRST island's seed eval instead. Skip in synthetic
+        # mode (no live keys → no real harness to be broken).
+        if not _is_synthetic_eval(evaluator, eval_res) and _is_all_errored(eval_res):
+            n_tasks = int(eval_res.metrics.get("n_tasks", 0.0))
+            errored = int(eval_res.metrics.get("errored_count", 0.0))
+            first_err = _first_error_message(eval_res)
+            raise RuntimeError(
+                f"inner harness appears broken: {errored}/{n_tasks} tasks "
+                f"errored at seed eval (island {i}). Aborting before burning "
+                f"proposer budget. First error: {first_err}"
+            )
         seed_prog = Program(
             id=new_program_id(),
             artifact=variant,
@@ -246,6 +275,13 @@ def run_evolution(
     # Per-task failure-streak counters for the persistent-failure window.
     # task_id -> int (consecutive failed iters since last pass).
     persistent_failure_streaks: Dict[str, int] = {}
+    # kai-skills patch (2026-05-28 silent-fail incident): forward-progress
+    # watchdog. Counts CONSECUTIVE iterations whose candidate eval was
+    # all-errored (errored_count == n_tasks). A harness that dies mid-run
+    # would otherwise grind silently to max-iters; abort after
+    # CONSECUTIVE_ERROR_ABORT such iters. Reset on any iter that ran a clean
+    # eval (n_tasks > 0 and not all-errored).
+    consecutive_all_errored = 0
     for gen in range(1, config.num_generations + 1):
         island = (gen - 1) % config.num_islands
         try:
@@ -288,6 +324,34 @@ def run_evolution(
             logger.warning("iter %d: island %d empty (%s); skipping", gen, island, exc)
             continue
         _append_history(history_path, res)
+
+        # kai-skills patch (2026-05-28 silent-fail incident): forward-progress
+        # watchdog. Only iters that actually ran a candidate eval (n_tasks > 0)
+        # count toward the streak — proposer parse_error / empty-island skips
+        # are a different failure mode and must not arm the harness watchdog.
+        # In synthetic mode there is no real harness to break, so skip.
+        cand_n_tasks = int(res.metrics.get("n_tasks", 0.0))
+        cand_errored = int(res.metrics.get("errored_count", 0.0))
+        if cand_n_tasks > 0 and not getattr(evaluator, "force_synthetic", False):
+            if cand_errored >= cand_n_tasks:
+                consecutive_all_errored += 1
+                logger.warning(
+                    "iter %d: candidate eval all-errored (%d/%d tasks) — "
+                    "consecutive=%d/%d",
+                    gen,
+                    cand_errored,
+                    cand_n_tasks,
+                    consecutive_all_errored,
+                    CONSECUTIVE_ERROR_ABORT,
+                )
+                if consecutive_all_errored >= CONSECUTIVE_ERROR_ABORT:
+                    raise RuntimeError(
+                        f"inner harness systematically erroring: "
+                        f"{consecutive_all_errored} consecutive all-errored "
+                        f"evals — aborting"
+                    )
+            else:
+                consecutive_all_errored = 0
 
         # kai-skills patch: incremental best-so-far checkpoint.
         try:
@@ -438,6 +502,73 @@ def _decode_eval_artifacts(raw: Dict[str, str]) -> Dict[str, Any]:
                 pass
         decoded[k] = v
     return decoded
+
+
+# kai-skills patch (2026-05-28 silent-fail incident): broken-harness
+# classification helpers for the seed-eval guard above. A broken inner
+# harness returns a well-formed result whose every task carries an
+# INFRA_ERROR_STATUSES verifier_status — distinct from a skill that simply
+# fails to verify. These helpers read the float metrics + artifacts channel
+# the evaluator already populates; they do NOT re-run anything.
+
+
+def _is_all_errored(eval_res: EvaluationResult) -> bool:
+    """True iff the eval ran ≥1 task and EVERY task was an infra error.
+
+    Compares the ``errored_count`` / ``n_tasks`` float metrics the evaluator
+    stamps in ``_translate``. ``n_tasks == 0`` (nothing ran) is not treated
+    as all-errored — that is an empty-task-set config issue, not a broken
+    harness.
+    """
+    n_tasks = int(eval_res.metrics.get("n_tasks", 0.0))
+    errored = int(eval_res.metrics.get("errored_count", 0.0))
+    return n_tasks > 0 and errored >= n_tasks
+
+
+def _is_synthetic_eval(
+    evaluator: SkillFolderEvaluator, eval_res: EvaluationResult
+) -> bool:
+    """True when the eval ran without a live harness (no real keys).
+
+    Synthetic mode has no real subprocess/harness to break, so the
+    broken-harness abort must NOT fire there. Authoritative per-eval signal
+    is the ``synthetic`` artifacts flag (an eval can fall back to synthetic
+    even with ``force_synthetic=False`` when no key resolves); also honor the
+    configured ``force_synthetic`` flag defensively.
+    """
+    if getattr(evaluator, "force_synthetic", False):
+        return True
+    return (eval_res.artifacts or {}).get("synthetic") == "1"
+
+
+def _first_error_message(eval_res: EvaluationResult) -> str:
+    """Pull a representative infra-error message from the eval result.
+
+    Prefers the first ``per_task`` entry whose ``verifier_status`` is in
+    INFRA_ERROR_STATUSES (formatting ``<status>: <last_msg>``), then falls
+    back to the first ``failures`` entry's ``last_msg``, then to a generic
+    placeholder so the abort message is never empty.
+    """
+    artifacts = eval_res.artifacts or {}
+    try:
+        per_task = json.loads(artifacts.get("per_task", "[]"))
+    except (json.JSONDecodeError, TypeError):
+        per_task = []
+    for t in per_task:
+        if not isinstance(t, dict):
+            continue
+        status = t.get("verifier_status")
+        if status in INFRA_ERROR_STATUSES:
+            msg = (t.get("last_msg") or "").strip()
+            return f"{status}: {msg}" if msg else str(status)
+    try:
+        failures = json.loads(artifacts.get("failures", "[]"))
+    except (json.JSONDecodeError, TypeError):
+        failures = []
+    for f in failures:
+        if isinstance(f, dict) and (f.get("last_msg") or "").strip():
+            return f["last_msg"].strip()
+    return "(no error detail in eval artifacts)"
 
 
 # kai-skills patch (Phase E, 2026-04-29): anonymizer dispatch + R-12

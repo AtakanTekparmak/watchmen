@@ -20,11 +20,44 @@ from __future__ import annotations
 import logging
 import os
 import random
+import time
 from typing import Optional, Protocol
 
 from .folder_artifact import FolderArtifact
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Proposer error taxonomy.
+#
+# kai-skills patch (2026-05-28 silent-fail hardening): the 2026-05-28 real-LLM
+# smoke proved a dead/expired proposer key fails SILENTLY — the canonical
+# partition path swallowed every proposer exception to "", the run rejected to
+# max-iters, and the broken harness masqueraded as "evolution found no
+# improvement" while burning $3-6. Per the user's HARD RULE we now FAIL LOUD on
+# auth: a dead key must abort the run, never be retried into a null result.
+# Transient errors (429 / 5xx) get bounded backoff and only then surface.
+# ---------------------------------------------------------------------------
+
+
+class ProposerAuthError(RuntimeError):
+    """Fatal: the proposer key was rejected (HTTP 401/403).
+
+    Raised by :meth:`OpenRouterLLM.generate` and intended to propagate all
+    the way out of the evolution loop. Per the silent-fail incident a dead
+    key must abort the run, NOT be retried or swallowed to an empty patch.
+    """
+
+
+class ProposerTransientError(RuntimeError):
+    """Transient proposer failure (HTTP 429 / 5xx) that survived retries.
+
+    Raised after the bounded exponential backoff in
+    :meth:`OpenRouterLLM.generate` is exhausted. Callers may treat this as a
+    skippable iteration (current behavior) — unlike :class:`ProposerAuthError`
+    it is not necessarily fatal.
+    """
 
 
 class LLMClient(Protocol):
@@ -145,6 +178,83 @@ class OpenRouterLLM:
         self._raw_log_dir = os.environ.get("OPENROUTER_RAW_LOG_DIR")
         self._raw_log_counter = 0
 
+    # kai-skills patch (2026-05-28 silent-fail hardening): bounded backoff
+    # schedule for transient (429 / 5xx) proposer failures. Three attempts at
+    # 2/4/8s. Auth (401/403) is NEVER retried — it raises ProposerAuthError on
+    # the first hit so a dead key aborts the run immediately (HARD RULE).
+    _TRANSIENT_BACKOFF_S: tuple[float, ...] = (2.0, 4.0, 8.0)
+
+    def _create_completion(self, **kwargs):
+        """Call the chat-completions endpoint with auth/transient handling.
+
+        kai-skills patch (2026-05-28 silent-fail hardening): classify SDK
+        errors so a dead key FAILS LOUD instead of being silently retried into
+        a null result. HTTP 401/403 -> :class:`ProposerAuthError` (fatal, no
+        retry); HTTP 429 / 5xx -> bounded exponential backoff, then
+        :class:`ProposerTransientError`. Other errors propagate unchanged.
+        """
+        from openai import (  # type: ignore
+            APIConnectionError,
+            APIStatusError,
+            APITimeoutError,
+            AuthenticationError,
+            InternalServerError,
+            PermissionDeniedError,
+            RateLimitError,
+        )
+
+        attempts = len(self._TRANSIENT_BACKOFF_S)
+        last_exc: Optional[Exception] = None
+        for attempt in range(attempts):
+            try:
+                return self._client.chat.completions.create(**kwargs)
+            except (AuthenticationError, PermissionDeniedError) as exc:
+                # Dead/expired/forbidden key — fatal, never retried.
+                status = getattr(exc, "status_code", None)
+                raise ProposerAuthError(
+                    f"proposer auth failed (HTTP {status}, model={self._model!r}): "
+                    f"{exc}. Aborting run — a dead key must not be silently "
+                    f"retried (2026-05-28 silent-fail incident)."
+                ) from exc
+            except (
+                RateLimitError,
+                InternalServerError,
+                APITimeoutError,
+                APIConnectionError,
+            ) as exc:
+                last_exc = exc
+            except APIStatusError as exc:
+                # Catch-all for status codes without a dedicated SDK subclass:
+                # 401/403 -> auth (fatal); 429/5xx -> transient; else re-raise.
+                status = getattr(exc, "status_code", None)
+                if status in (401, 403):
+                    raise ProposerAuthError(
+                        f"proposer auth failed (HTTP {status}, "
+                        f"model={self._model!r}): {exc}. Aborting run — a dead "
+                        f"key must not be silently retried (2026-05-28 "
+                        f"silent-fail incident)."
+                    ) from exc
+                if status == 429 or (status is not None and 500 <= status < 600):
+                    last_exc = exc
+                else:
+                    raise
+            if attempt < attempts - 1:
+                delay = self._TRANSIENT_BACKOFF_S[attempt]
+                logger.warning(
+                    "proposer transient error (%s) on attempt %d/%d; retrying "
+                    "in %.0fs (model=%s)",
+                    type(last_exc).__name__,
+                    attempt + 1,
+                    attempts,
+                    delay,
+                    self._model,
+                )
+                time.sleep(delay)
+        raise ProposerTransientError(
+            f"proposer transient failure after {attempts} attempts "
+            f"(model={self._model!r}): {last_exc}"
+        ) from last_exc
+
     def generate(self, *, system: str, user: str) -> str:
         # kai-skills patch (2026-04-25 — fix track-b K2.6 parse_error)
         kwargs: dict = dict(
@@ -162,7 +272,10 @@ class OpenRouterLLM:
         # kai-skills patch (Group E, 2026-05-28): forward optional seed.
         if self._seed is not None:
             kwargs["seed"] = self._seed
-        resp = self._client.chat.completions.create(**kwargs)
+        # kai-skills patch (2026-05-28 silent-fail hardening): route through
+        # the classifying wrapper so a dead key raises ProposerAuthError
+        # (fatal) instead of an opaque SDK error the partition path swallows.
+        resp = self._create_completion(**kwargs)
         msg = resp.choices[0].message
         content = msg.content or ""
         finish_reason = resp.choices[0].finish_reason

@@ -11,7 +11,7 @@ dependencies = [
     "datasets>=2.20",
     "huggingface-hub>=0.24",
     "hermes-agent[cli]",
-    "benchflow>=0.3.0a7",
+    "benchflow>=0.3.4,<0.4",
 ]
 
 [project.scripts]

@@ -32,8 +32,8 @@ uv run python scripts/expand_skillsbench_manifest.py 2>&1 | tail -5
 echo ">>> [3/8] uv sync"
 uv sync
 
-echo ">>> [4/8] uv pip install 'benchflow>=0.3.0a7'"
-uv pip install 'benchflow>=0.3.0a7'
+echo ">>> [4/8] uv pip install 'benchflow>=0.3.4,<0.4'"
+uv pip install 'benchflow>=0.3.4,<0.4'
 
 echo ">>> [5/8] verify bench CLI is callable via uv run"
 if uv run bench --help >/dev/null 2>&1; then

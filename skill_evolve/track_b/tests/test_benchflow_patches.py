@@ -262,12 +262,15 @@ def test_bench_cli_argv_uses_patch_shim() -> None:
     assert _BENCH_SHIM_CODE.index("_benchflow_patches") < _BENCH_SHIM_CODE.index(
         "benchflow.cli.main"
     )
-    # Standard bench eval create flags survive.
+    # Standard bench eval create flags survive. benchflow 0.3.4 accepts only
+    # the long forms (--config/--tasks-dir/--agent/--model); the short
+    # -f/-t/-a/-m aliases were dropped and silently zeroed every candidate at
+    # arg-parse (2026-05-28 silent-fail incident).
     assert argv[3:5] == ["eval", "create"]
-    assert "-f" in argv and "/tmp/scene.yaml" in argv
-    assert "-t" in argv and "/tasks/foo" in argv
-    # ``-a`` resolves to the SG-1-registered ``claude-code`` agent in the
+    assert "--config" in argv and "/tmp/scene.yaml" in argv
+    assert "--tasks-dir" in argv and "/tasks/foo" in argv
+    # ``--agent`` resolves to the SG-1-registered ``claude-code`` agent in the
     # subprocess registry; the shim above performs that registration before
-    # ``benchflow.cli.main`` resolves the ``-a`` flag.
-    assert "-a" in argv and "claude-code" in argv
-    assert "-m" in argv and "claude-opus-4-7" in argv
+    # ``benchflow.cli.main`` resolves the ``--agent`` flag.
+    assert "--agent" in argv and "claude-code" in argv
+    assert "--model" in argv and "claude-opus-4-7" in argv
