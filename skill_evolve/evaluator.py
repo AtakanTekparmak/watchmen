@@ -829,11 +829,22 @@ def evaluate(
                 keep_sandbox=keep_sandbox,
             )
         else:
+            # Hang-cap (2026-05-29): a qwen-via-OpenRouter agent can BLOCK on a
+            # stalled request with no SDK-level timeout (observed on
+            # lab-unit-harmonization — frozen network, agent never returns).
+            # The bench subprocess only releases at task ``timeout_s`` (often
+            # set high), so one hung task stalls the whole run. SKILL_EVOLVE_MAX_TASK_S
+            # caps the per-task subprocess timeout so a hang becomes a fast
+            # bench_cli_error (caught by errored_count) instead of an
+            # indefinite stall. 0/unset = no cap (back-compat).
+            _task_to = int(task.get("timeout_s", 600) or 600)
+            _cap = int(os.environ.get("SKILL_EVOLVE_MAX_TASK_S", "0") or "0")
+            _eff_to = min(_task_to, _cap) if _cap > 0 else _task_to
             traj = backend.run_task(
                 task,
                 skills_dir=skills_folder_path,
                 model=chosen_model,
-                timeout_s=int(task.get("timeout_s", 600) or 600),
+                timeout_s=_eff_to,
                 budget_usd=0.0,
                 anonymize_map=None,
                 agent=agent,
